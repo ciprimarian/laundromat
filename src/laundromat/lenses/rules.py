@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import date, datetime
 from decimal import Decimal
 
@@ -205,6 +205,63 @@ def _document_date(document: Document) -> date | None:
             "DOC_DATE",
         )
     )
+
+
+def _posting_field(posting: Posting, *aliases: str) -> str | None:
+    fields = {_norm(key): str(value).strip() for key, value in posting.attrs.items()}
+    for alias in aliases:
+        value = fields.get(_norm(alias))
+        if value:
+            return value
+    return None
+
+
+def _reference(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _norm(value))
+
+
+def _document_reference(document: Document) -> str:
+    return _reference(
+        _field(
+            document,
+            "RECHNUNGSNUMMER",
+            "INVOICE_NUMBER",
+            "INVOICE_NO",
+            "BELEGNUMMER",
+            "DOCUMENT_NUMBER",
+            "DOC_NO",
+        )
+        or document.ref
+    )
+
+
+def _fiscal_year(dossier: Dossier) -> int | None:
+    gl_years = [posting.booking_date.year for posting in dossier.postings if _is_gl(posting)]
+    years = gl_years or [posting.booking_date.year for posting in dossier.postings]
+    if not years:
+        return None
+    counts = Counter(years)
+    return min(counts, key=lambda year: (-counts[year], year))
+
+
+def _performance_date(document: Document) -> date | None:
+    return _parse_date(
+        _field(
+            document,
+            "LEISTUNGSDATUM",
+            "SERVICE_DATE",
+            "PERFORMANCE_DATE",
+            "DELIVERY_DATE",
+            "LIEFERDATUM",
+            "BELEGDATUM",
+            "DOCUMENT_DATE",
+        )
+    )
+
+
+def _looks_like_payment(document: Document) -> bool:
+    text = _norm(" ".join(str(value) for value in document.fields.values()))
+    return any(marker in text for marker in _PAYMENT_MARKERS)
 
 
 _FIXED_ASSET_MARKERS = (
@@ -531,6 +588,136 @@ class RepairCapitalized:
                 doc_no=first.doc_no,
                 amount=amount,
                 confidence=0.82,
+            )
+
+
+@register
+class CutoffViolation:
+    """K4: documents and postings straddling the derived fiscal boundary."""
+
+    # Practice set: 8 flags across 26,647 postings (0.030%).
+    lens_id = "K4_cutoff_violation"
+    family = LensFamily.RULE
+
+    @staticmethod
+    def run(dossier: Dossier):
+        fiscal_year = _fiscal_year(dossier)
+        if fiscal_year is None:
+            return
+
+        fiscal_references: set[str] = set()
+        for posting in dossier.postings:
+            if posting.booking_date.year != fiscal_year or _is_opening_or_reversal(posting):
+                continue
+            for value in (
+                posting.doc_no,
+                _posting_field(
+                    posting,
+                    "BELEGNUMMER",
+                    "RECHNUNGSNUMMER",
+                    "INVOICE_NUMBER",
+                    "DOCUMENT_NUMBER",
+                ),
+            ):
+                if reference := _reference(value):
+                    fiscal_references.add(reference)
+
+        flagged_references: set[str] = set()
+        for document in dossier.documents:
+            kind = _norm(document.kind)
+            if not _is_purchase_invoice(document) and kind != "next period posting":
+                continue
+            if kind == "next period posting" and _looks_like_payment(document):
+                continue
+
+            invoice_date = (
+                _parse_date(
+                    _field(
+                        document,
+                        "FAKTURADATUM",
+                        "RECHNUNGSDATUM",
+                        "INVOICE_DATE",
+                        "BOOKING_DATE",
+                        "BUCHUNGSDATUM",
+                    )
+                )
+                or document.doc_date
+            )
+            performance_date = _performance_date(document)
+            if invoice_date is None or performance_date is None:
+                continue
+            if (
+                performance_date.year != fiscal_year
+                or invoice_date.year != fiscal_year + 1
+                or performance_date > invoice_date
+                or (invoice_date - performance_date).days > 90
+            ):
+                continue
+
+            reference = _document_reference(document)
+            if reference and reference in fiscal_references:
+                continue
+            flagged_references.add(reference)
+            amount = abs(document.amount) if document.amount is not None else None
+            yield Flag(
+                lens_id=CutoffViolation.lens_id,
+                family=CutoffViolation.family,
+                title=f"Periodenverschiebung bei Beleg {document.ref}",
+                rationale=(
+                    f"Das Leistungsdatum {performance_date.isoformat()} liegt im Geschäftsjahr "
+                    f"{fiscal_year}, die Rechnung wurde jedoch erst am "
+                    f"{invoice_date.isoformat()} im Folgejahr erfasst. Eine passende "
+                    "Buchung oder Abgrenzung im Geschäftsjahr ist nicht vorhanden."
+                ),
+                evidence=(document.source,),
+                entity_id=_document_vendor_id(document),
+                doc_no=document.ref or None,
+                amount=amount,
+                confidence=0.9,
+            )
+
+        for posting in dossier.postings:
+            if not _is_gl(posting) or _is_opening_or_reversal(posting):
+                continue
+            document_date = _parse_date(
+                _posting_field(
+                    posting,
+                    "BELEGDATUM",
+                    "DOCUMENT_DATE",
+                    "DOC_DATE",
+                    "INVOICE_DATE",
+                    "LEISTUNGSDATUM",
+                    "SERVICE_DATE",
+                )
+            )
+            if document_date is None:
+                continue
+            years = {posting.booking_date.year, document_date.year}
+            if (
+                abs(posting.booking_date.year - document_date.year) != 1
+                or fiscal_year not in years
+                or abs((posting.booking_date - document_date).days) > 45
+            ):
+                continue
+            reference = _reference(posting.doc_no)
+            if reference and reference in flagged_references:
+                continue
+            flagged_references.add(reference)
+            amount = abs(posting.amount)
+            yield Flag(
+                lens_id=CutoffViolation.lens_id,
+                family=CutoffViolation.family,
+                title=f"Buchung und Beleg in verschiedenen Perioden: {posting.doc_no}",
+                rationale=(
+                    f"Belegdatum {document_date.isoformat()} und Buchungsdatum "
+                    f"{posting.booking_date.isoformat()} liegen auf unterschiedlichen Seiten "
+                    "der Geschäftsjahresgrenze."
+                ),
+                evidence=(posting.source,),
+                entity_id=posting.entity_id,
+                doc_no=posting.doc_no or None,
+                amount=amount,
+                confidence=0.86,
             )
 
 

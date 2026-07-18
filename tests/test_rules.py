@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from laundromat.contracts import Dossier, Document, Entity, EntityType, LensFamily, Posting, SourceRef
 from laundromat.lenses.rules import (
+    CutoffViolation,
     NewVendorQuickPayment,
     RepairCapitalized,
     RoundAmount,
@@ -429,6 +430,141 @@ class RepairCapitalizedTests(unittest.TestCase):
 
     def test_empty_dossier_is_safe(self):
         self.assertEqual(list(RepairCapitalized.run(Dossier(name="empty"))), [])
+
+
+class CutoffViolationTests(unittest.TestCase):
+    def test_derives_year_and_flags_english_purchase_invoice_shift(self):
+        invoice = Document(
+            kind="purchase_invoice",
+            ref="INV-2032-1",
+            source=SourceRef(
+                file="support/vendor_invoices.csv",
+                line=2,
+                excerpt="INV-2032-1;2032-01-12;2031-12-20;V1;22000",
+            ),
+            entity_id="V1",
+            doc_date=date(2032, 1, 12),
+            amount=Decimal("22000"),
+            fields={"INVOICE_DATE": "2032-01-12", "SERVICE_DATE": "2031-12-20"},
+        )
+        dossier = Dossier(
+            name="shift",
+            postings=[
+                posting(
+                    "100",
+                    line=2,
+                    doc_no="BASE",
+                    booking_date=date(2031, 6, 1),
+                )
+            ],
+            documents=[invoice],
+        )
+
+        flags = list(CutoffViolation.run(dossier))
+
+        self.assertEqual(len(flags), 1)
+        self.assertEqual(flags[0].doc_no, "INV-2032-1")
+        self.assertEqual(flags[0].entity_id, "V1")
+        self.assertEqual(flags[0].amount, Decimal("22000"))
+        self.assertEqual(flags[0].evidence, (invoice.source,))
+
+    def test_flags_gl_document_date_straddle(self):
+        crossing = posting(
+            "31000",
+            line=3,
+            doc_no="YEAR-END",
+            booking_date=date(2032, 1, 4),
+            attrs={"BELEGDATUM": "28.12.2031"},
+        )
+        dossier = Dossier(
+            name="gl-shift",
+            postings=[
+                posting(
+                    "100",
+                    line=2,
+                    doc_no="BASE",
+                    booking_date=date(2031, 6, 1),
+                ),
+                crossing,
+            ],
+        )
+
+        flags = list(CutoffViolation.run(dossier))
+
+        self.assertEqual(len(flags), 1)
+        self.assertEqual(flags[0].doc_no, "YEAR-END")
+        self.assertEqual(flags[0].evidence, (crossing.source,))
+
+    def test_ignores_accrued_same_year_same_year_invoice_and_next_period_cash(self):
+        accrued = Document(
+            kind="purchase_invoice",
+            ref="ACCRUED-1",
+            source=SourceRef(file="support/invoices.csv", line=2, excerpt="ACCRUED-1"),
+            doc_date=date(2032, 1, 5),
+            fields={"LEISTUNGSDATUM": "20.12.2031"},
+        )
+        same_year = Document(
+            kind="purchase_invoice",
+            ref="SAME-1",
+            source=SourceRef(file="support/invoices.csv", line=3, excerpt="SAME-1"),
+            doc_date=date(2031, 12, 22),
+            fields={"LEISTUNGSDATUM": "20.12.2031"},
+        )
+        cash = Document(
+            kind="next_period_posting",
+            ref="CASH-1",
+            source=SourceRef(file="support/next_period.csv", line=2, excerpt="CASH-1;payment"),
+            doc_date=date(2032, 1, 6),
+            fields={"BUCHUNGSTEXT": "Payment receipt / settlement"},
+        )
+        dossier = Dossier(
+            name="good",
+            postings=[
+                posting(
+                    "100",
+                    line=2,
+                    doc_no="BASE",
+                    booking_date=date(2031, 1, 1),
+                ),
+                posting(
+                    "50000",
+                    line=3,
+                    doc_no="ACCRUED-1",
+                    booking_date=date(2031, 12, 31),
+                ),
+            ],
+            documents=[accrued, same_year, cash],
+        )
+
+        self.assertEqual(list(CutoffViolation.run(dossier)), [])
+
+    def test_empty_and_malformed_dossiers_are_safe(self):
+        malformed = Document(
+            kind="purchase_invoice",
+            ref="BAD-DATE",
+            source=SourceRef(file="support/invoices.csv", line=2, excerpt="BAD-DATE;oops"),
+            fields={"INVOICE_DATE": "not-a-date", "SERVICE_DATE": "also-bad"},
+        )
+        self.assertEqual(list(CutoffViolation.run(Dossier(name="empty"))), [])
+        self.assertEqual(
+            list(
+                CutoffViolation.run(
+                    Dossier(
+                        name="malformed",
+                        postings=[
+                            posting(
+                                "100",
+                                line=2,
+                                doc_no="BASE",
+                                booking_date=date(2031, 1, 1),
+                            )
+                        ],
+                        documents=[malformed],
+                    )
+                )
+            ),
+            [],
+        )
 
 
 class SplitPaymentsTests(unittest.TestCase):
