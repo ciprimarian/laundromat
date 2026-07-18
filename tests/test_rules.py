@@ -8,6 +8,7 @@ from laundromat.contracts import Dossier, Document, Entity, EntityType, LensFami
 from laundromat.lenses.rules import (
     CutoffViolation,
     NewVendorQuickPayment,
+    NoGoodsReceipt,
     RepairCapitalized,
     RoundAmount,
     SplitPayments,
@@ -259,6 +260,143 @@ class NewVendorQuickPaymentTests(unittest.TestCase):
 
     def test_empty_dossier_is_safe(self):
         self.assertEqual(list(NewVendorQuickPayment.run(Dossier(name="empty"))), [])
+
+
+class NoGoodsReceiptTests(unittest.TestCase):
+    def goods_postings(self, vendor_id: str = "V1", doc_no: str = "INV-1") -> list[Posting]:
+        return [
+            posting(
+                "30000",
+                line=10,
+                doc_no=doc_no,
+                text="Zahlungsausgang",
+                booking_date=date(2025, 6, 10),
+                entity_id=vendor_id,
+                ledger="AP",
+                account=vendor_id,
+            ),
+            posting(
+                "25210.08",
+                line=11,
+                doc_no=doc_no,
+                text="Eingangsrechnung Material",
+                booking_date=date(2025, 6, 8),
+                account="MAT",
+            ),
+        ]
+
+    def receipt(
+        self,
+        reference: str | None,
+        vendor_id: str,
+        amount: str,
+        receipt_date: date,
+    ) -> Document:
+        fields = {"KREDITOR": vendor_id}
+        if reference is not None:
+            fields["RECHNUNGSNUMMER"] = reference
+        return Document(
+            kind="goods_receipt",
+            ref="GR-1",
+            source=SourceRef(
+                file="support/goods_receipts.csv",
+                line=2,
+                excerpt=f"GR-1;{reference or ''};{vendor_id};{amount}",
+            ),
+            entity_id=vendor_id,
+            doc_date=receipt_date,
+            amount=Decimal(amount),
+            fields=fields,
+        )
+
+    def test_exact_invoice_and_vendor_match_is_silent(self):
+        dossier = Dossier(
+            name="matched",
+            entities={
+                "V1": vendor("V1", line=2),
+                "MAT": account("MAT", "Roh-, Hilfs- und Betriebsstoffe", line=3),
+            },
+            postings=self.goods_postings(),
+            documents=[self.receipt("INV-1", "V1", "30000", date(2025, 6, 8))],
+        )
+
+        self.assertEqual(list(NoGoodsReceipt.run(dossier)), [])
+
+    def test_flags_missing_receipt_and_cites_payment_and_goods_row(self):
+        dossier = Dossier(
+            name="missing",
+            entities={
+                "V1": vendor("V1", line=2),
+                "V2": vendor("V2", line=3),
+                "MAT": account("MAT", "Inventory raw materials", line=4),
+            },
+            postings=self.goods_postings(),
+            documents=[self.receipt("OTHER", "V2", "30000", date(2025, 6, 8))],
+        )
+
+        flags = list(NoGoodsReceipt.run(dossier))
+
+        self.assertEqual(len(flags), 1)
+        self.assertEqual(flags[0].lens_id, "K2_no_goods_receipt")
+        self.assertEqual(flags[0].entity_id, "V1")
+        self.assertEqual(flags[0].doc_no, "INV-1")
+        self.assertEqual(flags[0].amount, Decimal("30000"))
+        self.assertEqual(len(flags[0].evidence), 2)
+
+    def test_service_exclusion_overrides_material_word(self):
+        dossier = Dossier(
+            name="service",
+            entities={
+                "V1": vendor("V1", line=2),
+                "SERV": account("SERV", "Material consulting service expense", line=3),
+            },
+            postings=[
+                self.goods_postings()[0],
+                posting(
+                    "25210.08",
+                    line=11,
+                    doc_no="INV-1",
+                    text="Material consulting service",
+                    account="SERV",
+                ),
+            ],
+            documents=[self.receipt("OTHER", "V1", "100", date(2025, 6, 8))],
+        )
+
+        self.assertEqual(list(NoGoodsReceipt.run(dossier)), [])
+
+    def test_fallback_matches_same_vendor_amount_within_thirty_days(self):
+        dossier = Dossier(
+            name="fallback",
+            entities={
+                "V1": vendor("V1", line=2),
+                "MAT": account("MAT", "Inventory", line=3),
+            },
+            postings=self.goods_postings(),
+            documents=[self.receipt(None, "V1", "30000", date(2025, 5, 12))],
+        )
+
+        self.assertEqual(list(NoGoodsReceipt.run(dossier)), [])
+
+    def test_empty_or_malformed_receipts_are_safe(self):
+        malformed = Document(
+            kind="goods_receipt",
+            ref="GR-BAD",
+            source=SourceRef(
+                file="support/goods_receipts.csv",
+                line=2,
+                excerpt="GR-BAD;;;;",
+            ),
+            fields={"RECHNUNGSNUMMER": ""},
+        )
+        dossier = Dossier(
+            name="malformed",
+            postings=self.goods_postings(),
+            documents=[malformed],
+        )
+
+        self.assertEqual(list(NoGoodsReceipt.run(dossier)), [])
+        self.assertEqual(list(NoGoodsReceipt.run(Dossier(name="empty"))), [])
 
 
 class RepairCapitalizedTests(unittest.TestCase):
@@ -517,6 +655,13 @@ class CutoffViolationTests(unittest.TestCase):
             doc_date=date(2032, 1, 6),
             fields={"BUCHUNGSTEXT": "Payment receipt / settlement"},
         )
+        document_date_only = Document(
+            kind="purchase_invoice",
+            ref="NO-SERVICE-DATE",
+            source=SourceRef(file="support/invoices.csv", line=4, excerpt="NO-SERVICE-DATE"),
+            doc_date=date(2032, 1, 5),
+            fields={"BELEGDATUM": "20.12.2031"},
+        )
         dossier = Dossier(
             name="good",
             postings=[
@@ -532,8 +677,15 @@ class CutoffViolationTests(unittest.TestCase):
                     doc_no="ACCRUED-1",
                     booking_date=date(2031, 12, 31),
                 ),
+                posting(
+                    "50000",
+                    line=4,
+                    doc_no="ACCRUED-1",
+                    booking_date=date(2032, 1, 5),
+                    attrs={"BELEGDATUM": "20.12.2031"},
+                ),
             ],
-            documents=[accrued, same_year, cash],
+            documents=[accrued, same_year, cash, document_date_only],
         )
 
         self.assertEqual(list(CutoffViolation.run(dossier)), [])
