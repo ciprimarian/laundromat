@@ -23,7 +23,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from ..contracts import Dossier, Finding, Flag, SourceRef
@@ -504,6 +504,7 @@ def api_coverage(run: str = "default"):
         "status": "ready",
         "dossier": dossier.name,
         "dossier_path": state["path"],
+        "auditor": state.get("auditor"),
         "counts": {
             "postings": len(dossier.postings),
             "entities": len(dossier.entities),
@@ -548,7 +549,7 @@ def _dossier_root(dest: Path) -> Path:
 
 
 @app.post("/upload")
-async def upload(files: list[UploadFile] = File(...)):
+async def upload(files: list[UploadFile] = File(...), auditor: str = Form("")):
     run_id = uuid.uuid4().hex[:8]
     dest = RUNS_DIR / run_id
     try:
@@ -572,6 +573,9 @@ async def upload(files: list[UploadFile] = File(...)):
                 path.unlink()
         root = _dossier_root(dest)
         _start_run(run_id, root.name, str(root))
+        if auditor.strip():
+            with _LOCK:
+                RUNS[run_id]["auditor"] = auditor.strip()[:80]
         return {"status": "ok", "run": run_id}
     except Exception as e:
         return JSONResponse({"status": "error", "error": f"{type(e).__name__}: {e}"}, status_code=400)
@@ -592,6 +596,7 @@ PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Laundromat</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='13' cy='13' r='8' fill='none' stroke='%230b5cad' stroke-width='3.5'/><line x1='19.5' y1='19.5' x2='28' y2='28' stroke='%230b5cad' stroke-width='3.5' stroke-linecap='round'/></svg>">
 <style>
 :root { --bg:#f6f7f9; --card:#ffffff; --ink:#1a232e; --mut:#5c6b7a; --line:#dde3ea;
         --acc:#0b5cad; --hi:#b42318; --med:#b54708; --rev:#5c6b7a; --ok:#067647; }
@@ -669,6 +674,11 @@ td.num { text-align:right; font-variant-numeric:tabular-nums; }
 .score { margin-left:auto; text-align:right; font-variant-numeric:tabular-nums;
          font-weight:600; color:var(--acc); white-space:nowrap; }
 .score .mut { display:block; font-weight:400; }
+#auditor { border:1px solid var(--line); border-radius:8px; padding:8px 10px;
+           font-size:13px; width:150px; }
+footer { border-top:1px solid var(--line); padding:14px 24px; color:var(--mut);
+         font-size:12px; }
+footer a { color:var(--mut); }
 </style>
 </head>
 <body>
@@ -681,6 +691,7 @@ td.num { text-align:right; font-variant-numeric:tabular-nums; }
   <span class="sub" id="status"></span>
   <span style="flex:1"></span>
   <button class="langbtn" id="langbtn" onclick="toggleLang()">DE</button>
+  <input id="auditor" maxlength="80">
   <div id="dropzone" title=""></div>
   <input type="file" id="filepick" multiple style="display:none">
 </header>
@@ -715,6 +726,7 @@ en: {
   tab_f:"Findings", tab_t:"Figure Tracer", tab_c:"Coverage",
   drop_idle:"Audit a dossier: drop zip here", drop_busy:"Uploading ...",
   drop_fail:"Upload failed", run_label:"Run", err:"Error",
+  auditor:"Auditor", auditor_ph:"Auditor name (optional)",
   loading:"Loading dossier", critical:"critical", medium:"medium",
   cleared:"checked & cleared", review:"under review",
   postings:"postings", entities:"entities", docs_examined:"documents examined",
@@ -750,6 +762,7 @@ de: {
   tab_f:"Feststellungen", tab_t:"Zahlenspur", tab_c:"Abdeckung",
   drop_idle:"Dossier pruefen: Zip hier ablegen", drop_busy:"Wird hochgeladen ...",
   drop_fail:"Upload fehlgeschlagen", run_label:"Lauf", err:"Fehler",
+  auditor:"Pruefer", auditor_ph:"Pruefername (optional)",
   loading:"Dossier wird geladen", critical:"kritisch", medium:"mittel",
   cleared:"geprueft & entlastet", review:"in Pruefung",
   postings:"Buchungen", entities:"Entitaeten", docs_examined:"Dokumente geprueft",
@@ -799,6 +812,7 @@ function applyChrome(){
   if(!dz.classList.contains("busy")) dz.textContent = t("drop_idle");
   dz.title = t("drop_idle");
   document.getElementById("traceq").placeholder = t("trace_ph");
+  document.getElementById("auditor").placeholder = t("auditor_ph");
   document.getElementById("tracebtn").textContent = t("trace_btn");
   document.getElementById("tracehint").textContent = t("trace_hint");
   if(RUN !== "default")
@@ -861,6 +875,9 @@ async function loadFindings(){
     el.innerHTML = `<div class="note">${esc(t("loading"))} (${esc(d.dossier_path)}) ...</div>`; return; }
   if(d.status==="error"){ el.innerHTML = `<div class="note err">${esc(t("err"))}: ${esc(d.error)}</div>`; return; }
   document.getElementById("dossiername").textContent = d.dossier;
+  if(RUN !== "default" && cov.status==="ready" && cov.auditor)
+    document.getElementById("status").textContent =
+      t("run_label") + " " + RUN + " \u00b7 " + t("auditor") + ": " + cov.auditor;
   const counts = cov.status==="ready" ? cov.counts : {};
   const kindKey = {entity:"kind_entity", transaction:"kind_transaction", lens:"kind_lens"};
   const mode = d.mode==="scored" ? "" : `<div class="note">${esc(t("mode_note"))}</div>`;
@@ -950,6 +967,8 @@ async function uploadFiles(files){
   dz.classList.add("busy"); dz.textContent = t("drop_busy");
   const fd = new FormData();
   for(const f of files) fd.append("files", f);
+  const aud = document.getElementById("auditor").value.trim();
+  if(aud) fd.append("auditor", aud);
   try{
     const r = await fetch("/upload", {method:"POST", body:fd});
     const d = await r.json();
@@ -962,5 +981,6 @@ async function uploadFiles(files){
 applyChrome();
 loadFindings(); loadCoverage();
 </script>
+<footer><a href="https://github.com/ciprimarian/laundromat" rel="noopener">github.com/ciprimarian/laundromat</a></footer>
 </body>
 </html>"""
