@@ -532,9 +532,10 @@ async def api_upload(file: UploadFile = File(...)):
     raw = await file.read()
     if not raw:
         return JSONResponse({"status": "error", "error": "empty upload"}, status_code=400)
-    if len(raw) > 200 * 1024 * 1024:
+    # hard cap keeps hostile uploads from filling the disk (60MB+ rejected)
+    if len(raw) > 50 * 1024 * 1024:
         return JSONResponse(
-            {"status": "error", "error": "zip larger than 200 MB"},
+            {"status": "error", "error": "zip larger than 50 MB"},
             status_code=400,
         )
 
