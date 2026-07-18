@@ -5,7 +5,13 @@ from datetime import date
 from decimal import Decimal
 
 from laundromat.contracts import Dossier, Document, Entity, EntityType, LensFamily, Posting, SourceRef
-from laundromat.lenses.rules import NewVendorQuickPayment, RoundAmount, SplitPayments
+from laundromat.lenses.rules import (
+    CutoffViolation,
+    NewVendorQuickPayment,
+    RepairCapitalized,
+    RoundAmount,
+    SplitPayments,
+)
 
 
 def source(line: int, excerpt: str) -> SourceRef:
@@ -22,17 +28,21 @@ def posting(
     booking_date: date = date(2025, 6, 1),
     entity_id: str | None = None,
     ledger: str = "GL",
+    account: str = "440000",
+    attrs: dict[str, str] | None = None,
 ) -> Posting:
+    posting_attrs = {"ledger": ledger}
+    posting_attrs.update(attrs or {})
     return Posting(
         doc_no=doc_no,
         booking_date=booking_date,
         amount=Decimal(amount),
-        account="440000",
+        account=account,
         source=source(line, f"{doc_no};{amount};{text}"),
         entity_id=entity_id,
         text=text,
         currency=currency,
-        attrs={"ledger": ledger},
+        attrs=posting_attrs,
     )
 
 
@@ -47,6 +57,20 @@ def vendor(vendor_id: str, *, line: int, created_at: date | None = None) -> Enti
             excerpt=f"{vendor_id};Vendor {vendor_id}",
         ),
         created_at=created_at,
+    )
+
+
+def account(account_id: str, name: str, *, line: int) -> Entity:
+    return Entity(
+        id=account_id,
+        type=EntityType.ACCOUNT,
+        name=name,
+        source=SourceRef(
+            file="Sachkonten/Sachkonten.txt",
+            line=line,
+            excerpt=f"{account_id};{name};Bilanz",
+        ),
+        attrs={"KONTENART": "Bilanz"},
     )
 
 
@@ -235,6 +259,312 @@ class NewVendorQuickPaymentTests(unittest.TestCase):
 
     def test_empty_dossier_is_safe(self):
         self.assertEqual(list(NewVendorQuickPayment.run(Dossier(name="empty"))), [])
+
+
+class RepairCapitalizedTests(unittest.TestCase):
+    def test_flags_direct_repair_text_on_prefixed_asset_account(self):
+        dossier = Dossier(
+            name="direct",
+            entities={"FA": account("FA", "Fixed asset machinery", line=2)},
+            postings=[
+                posting(
+                    "-27500",
+                    line=10,
+                    doc_no="INV-DIRECT",
+                    text="Machine repair and servicing",
+                    account="FA-001",
+                )
+            ],
+        )
+
+        flags = list(RepairCapitalized.run(dossier))
+
+        self.assertEqual(len(flags), 1)
+        self.assertEqual(flags[0].doc_no, "INV-DIRECT")
+        self.assertEqual(flags[0].amount, Decimal("27500"))
+        self.assertEqual(flags[0].evidence, (dossier.postings[0].source,))
+
+    def test_groups_asset_addition_and_german_repair_sibling_across_ledgers(self):
+        dossier = Dossier(
+            name="bad",
+            entities={"A100": account("A100", "Maschinen und maschinelle Anlagen", line=2)},
+            postings=[
+                posting(
+                    "28000",
+                    line=10,
+                    doc_no="ER-1",
+                    text="Acquisition",
+                    ledger="FA",
+                    account="A100-0001",
+                    attrs={"account_base": "A100", "BUCHUNGSART": "Zugang"},
+                ),
+                posting(
+                    "5320",
+                    line=11,
+                    doc_no="ER-1",
+                    text="Reparatur Konfektioniermaschine Linie 2",
+                    ledger="GL",
+                    account="VAT",
+                ),
+            ],
+        )
+
+        flags = list(RepairCapitalized.run(dossier))
+
+        self.assertEqual(len(flags), 1)
+        flag = flags[0]
+        self.assertEqual(flag.lens_id, "K3_repair_capitalized")
+        self.assertEqual(flag.doc_no, "ER-1")
+        self.assertEqual(flag.amount, Decimal("28000"))
+        self.assertEqual(len(flag.evidence), 2)
+        self.assertTrue(all(ref.line and ref.excerpt for ref in flag.evidence))
+
+    def test_supports_english_replacement_and_overhaul_terms(self):
+        dossier = Dossier(
+            name="english",
+            entities={"FA": account("FA", "Property, plant and equipment", line=2)},
+            postings=[
+                posting(
+                    "41000",
+                    line=10,
+                    doc_no="INV-1",
+                    text="Asset addition",
+                    account="FA-9",
+                    attrs={"account_base": "FA"},
+                ),
+                posting(
+                    "41000",
+                    line=11,
+                    doc_no="INV-1",
+                    text="Hydraulic unit replacement and overhaul",
+                    account="PAYABLE",
+                ),
+            ],
+        )
+
+        flags = list(RepairCapitalized.run(dossier))
+
+        self.assertEqual(len(flags), 1)
+        self.assertEqual(flags[0].doc_no, "INV-1")
+
+    def test_ignores_expense_investment_inventory_depreciation_and_opening(self):
+        entities = {
+            "FA": account("FA", "Fixed asset machinery", line=2),
+            "INV": account("INV", "Inventory and merchandise", line=3),
+        }
+        dossier = Dossier(
+            name="good",
+            entities=entities,
+            postings=[
+                posting(
+                    "30000",
+                    line=10,
+                    doc_no="EXPENSE",
+                    text="Repair expense",
+                    account="EXP",
+                ),
+                posting(
+                    "30000",
+                    line=11,
+                    doc_no="INVEST",
+                    text="Acquisition",
+                    account="FA-1",
+                    attrs={"account_base": "FA"},
+                ),
+                posting(
+                    "30000",
+                    line=12,
+                    doc_no="INVEST",
+                    text="New production line investment",
+                    account="PAYABLE",
+                ),
+                posting(
+                    "30000",
+                    line=13,
+                    doc_no="INVENTORY",
+                    text="Acquisition",
+                    account="INV-1",
+                    attrs={"account_base": "INV"},
+                ),
+                posting(
+                    "30000",
+                    line=14,
+                    doc_no="INVENTORY",
+                    text="Warehouse service",
+                    account="PAYABLE",
+                ),
+                posting(
+                    "30000",
+                    line=15,
+                    doc_no="DEPR",
+                    text="Depreciation",
+                    account="FA-2",
+                    attrs={"account_base": "FA"},
+                ),
+                posting(
+                    "30000",
+                    line=16,
+                    doc_no="DEPR",
+                    text="Machine maintenance",
+                    account="PAYABLE",
+                ),
+                posting(
+                    "30000",
+                    line=17,
+                    doc_no="AB-2024",
+                    text="Opening balance acquisition",
+                    account="FA-3",
+                    attrs={"account_base": "FA"},
+                ),
+                posting(
+                    "30000",
+                    line=18,
+                    doc_no="AB-2024",
+                    text="Repair",
+                    account="PAYABLE",
+                ),
+            ],
+        )
+
+        self.assertEqual(list(RepairCapitalized.run(dossier)), [])
+
+    def test_empty_dossier_is_safe(self):
+        self.assertEqual(list(RepairCapitalized.run(Dossier(name="empty"))), [])
+
+
+class CutoffViolationTests(unittest.TestCase):
+    def test_derives_year_and_flags_english_purchase_invoice_shift(self):
+        invoice = Document(
+            kind="purchase_invoice",
+            ref="INV-2032-1",
+            source=SourceRef(
+                file="support/vendor_invoices.csv",
+                line=2,
+                excerpt="INV-2032-1;2032-01-12;2031-12-20;V1;22000",
+            ),
+            entity_id="V1",
+            doc_date=date(2032, 1, 12),
+            amount=Decimal("22000"),
+            fields={"INVOICE_DATE": "2032-01-12", "SERVICE_DATE": "2031-12-20"},
+        )
+        dossier = Dossier(
+            name="shift",
+            postings=[
+                posting(
+                    "100",
+                    line=2,
+                    doc_no="BASE",
+                    booking_date=date(2031, 6, 1),
+                )
+            ],
+            documents=[invoice],
+        )
+
+        flags = list(CutoffViolation.run(dossier))
+
+        self.assertEqual(len(flags), 1)
+        self.assertEqual(flags[0].doc_no, "INV-2032-1")
+        self.assertEqual(flags[0].entity_id, "V1")
+        self.assertEqual(flags[0].amount, Decimal("22000"))
+        self.assertEqual(flags[0].evidence, (invoice.source,))
+
+    def test_flags_gl_document_date_straddle(self):
+        crossing = posting(
+            "31000",
+            line=3,
+            doc_no="YEAR-END",
+            booking_date=date(2032, 1, 4),
+            attrs={"BELEGDATUM": "28.12.2031"},
+        )
+        dossier = Dossier(
+            name="gl-shift",
+            postings=[
+                posting(
+                    "100",
+                    line=2,
+                    doc_no="BASE",
+                    booking_date=date(2031, 6, 1),
+                ),
+                crossing,
+            ],
+        )
+
+        flags = list(CutoffViolation.run(dossier))
+
+        self.assertEqual(len(flags), 1)
+        self.assertEqual(flags[0].doc_no, "YEAR-END")
+        self.assertEqual(flags[0].evidence, (crossing.source,))
+
+    def test_ignores_accrued_same_year_same_year_invoice_and_next_period_cash(self):
+        accrued = Document(
+            kind="purchase_invoice",
+            ref="ACCRUED-1",
+            source=SourceRef(file="support/invoices.csv", line=2, excerpt="ACCRUED-1"),
+            doc_date=date(2032, 1, 5),
+            fields={"LEISTUNGSDATUM": "20.12.2031"},
+        )
+        same_year = Document(
+            kind="purchase_invoice",
+            ref="SAME-1",
+            source=SourceRef(file="support/invoices.csv", line=3, excerpt="SAME-1"),
+            doc_date=date(2031, 12, 22),
+            fields={"LEISTUNGSDATUM": "20.12.2031"},
+        )
+        cash = Document(
+            kind="next_period_posting",
+            ref="CASH-1",
+            source=SourceRef(file="support/next_period.csv", line=2, excerpt="CASH-1;payment"),
+            doc_date=date(2032, 1, 6),
+            fields={"BUCHUNGSTEXT": "Payment receipt / settlement"},
+        )
+        dossier = Dossier(
+            name="good",
+            postings=[
+                posting(
+                    "100",
+                    line=2,
+                    doc_no="BASE",
+                    booking_date=date(2031, 1, 1),
+                ),
+                posting(
+                    "50000",
+                    line=3,
+                    doc_no="ACCRUED-1",
+                    booking_date=date(2031, 12, 31),
+                ),
+            ],
+            documents=[accrued, same_year, cash],
+        )
+
+        self.assertEqual(list(CutoffViolation.run(dossier)), [])
+
+    def test_empty_and_malformed_dossiers_are_safe(self):
+        malformed = Document(
+            kind="purchase_invoice",
+            ref="BAD-DATE",
+            source=SourceRef(file="support/invoices.csv", line=2, excerpt="BAD-DATE;oops"),
+            fields={"INVOICE_DATE": "not-a-date", "SERVICE_DATE": "also-bad"},
+        )
+        self.assertEqual(list(CutoffViolation.run(Dossier(name="empty"))), [])
+        self.assertEqual(
+            list(
+                CutoffViolation.run(
+                    Dossier(
+                        name="malformed",
+                        postings=[
+                            posting(
+                                "100",
+                                line=2,
+                                doc_no="BASE",
+                                booking_date=date(2031, 1, 1),
+                            )
+                        ],
+                        documents=[malformed],
+                    )
+                )
+            ),
+            [],
+        )
 
 
 class SplitPaymentsTests(unittest.TestCase):
