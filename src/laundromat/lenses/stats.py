@@ -1,11 +1,12 @@
 """Statistical lenses: Benford, round-number rate, robust outliers, duplicates.
 
-Practice-set flag rates (measured 2026-07-18 on data/practice, 26647 postings):
+Practice-set flag rates (calibrated post-scoring merge, 26647 postings):
   S_benford             1   0.00%  (partition flags; MAD cut ~0.055)
   S_round_frequency     0   0.00%  (round-1000 baseline ~0.1%)
   S_robust_outlier     28   0.11%  (z>8 and amount>=JET_FLOOR)
   S_duplicate_payment  14   0.05%  (one flag per cluster, not per pair)
   S_amount_precision   12   0.05%
+  # all << 2% of rows; no further threshold cuts
 
 Confidence stays in 0.2-0.5: population stats are leads, not verdicts.
 Every baseline (round rate, MAD cut) is derived from the dossier itself.

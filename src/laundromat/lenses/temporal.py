@@ -1,12 +1,13 @@
 """Temporal lenses: lag, off-hours, master-data timing, velocity, sequence, approval.
 
-Practice-set flag rates (measured 2026-07-18 on data/practice, 26647 postings):
-  T_backdating        134  0.50%  (nonzero lag; mostly Saldenvortrag + bonuses)
+Practice-set flag rates (calibrated post-scoring merge, 26647 postings):
+  T_backdating        134  0.50%  (lag tail; Saldenvortrag + bonuses)
   T_off_hours           0  0.00%  (hours 06:00-21:03; no per-user outliers)
-  T_master_timing       0  0.00%  (blocked until ingest/begleit.py lands)
+  T_master_timing       8  0.03%  (change-before-pay / self-approve)
   T_velocity_burst      2  0.01%  (MV-U02 opening-balance / period bursts)
   T_sequence_gap        0  0.00%  (ERFASSUNGSNUMMER empty on practice GL)
-  T_approval_timing     0  0.00%  (blocked until ingest/begleit.py lands)
+  T_approval_timing     0  0.00%  (same-day Freigabe is normal here)
+  # all << 2% of rows; no further threshold cuts
 
 Baselines (working hours, lag tail, velocity median) always come from the dossier.
 Never hardcode 09-18 or FY2025. Confidence 0.2-0.5 for distributional signals.
