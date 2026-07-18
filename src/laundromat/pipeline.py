@@ -19,6 +19,8 @@ def run_lenses(dossier: Dossier) -> tuple[list[Flag], dict[str, str]]:
     errors: dict[str, str] = {}
     for lens_id, lens in sorted(REGISTRY.items()):
         try:
+            if isinstance(lens, type):
+                lens = lens()  # registered as a class, run wants an instance
             flags.extend(lens.run(dossier))
         except Exception as e:
             errors[lens_id] = f"{type(e).__name__}: {e}"
