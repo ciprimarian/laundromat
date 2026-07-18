@@ -1,12 +1,12 @@
 """Statistical lenses: Benford, round-number rate, robust outliers, duplicates.
 
-Practice-set flag rates (calibrated post-scoring merge, 26647 postings):
-  S_benford             1   0.00%  (partition flags; MAD cut ~0.055)
-  S_round_frequency     0   0.00%  (round-1000 baseline ~0.1%)
-  S_robust_outlier     28   0.11%  (z>8 and amount>=JET_FLOOR)
-  S_duplicate_payment  14   0.05%  (one flag per cluster, not per pair)
-  S_amount_precision   12   0.05%
-  # all << 2% of rows; no further threshold cuts
+Practice-set flag rates (after excluding opening balances / Vortrag):
+  S_benford             0   0.00%
+  S_round_frequency     0   0.00%
+  S_robust_outlier     10   0.04%
+  S_duplicate_payment   4   0.02%
+  S_amount_precision    4   0.02%
+  # AB-2024 Saldenvortrag dropped; all << 2% of rows
 
 Confidence stays in 0.2-0.5: population stats are leads, not verdicts.
 Every baseline (round rate, MAD cut) is derived from the dossier itself.
@@ -43,6 +43,36 @@ _MIN_DUP_AMOUNT = Decimal("100")  # ignore penny noise
 _DUP_WINDOW_DAYS = 14
 _NEAR_EDIT_DIST = 2  # transposition of two digits is edit distance 2
 _MAX_EVIDENCE = 8
+
+# Opening balances are not economic activity; drop from baselines and flags.
+_OPENING_TEXT_PREFIXES = (
+    "saldenvortrag",
+    "opening balance",
+    "brought forward",
+    "balance brought forward",
+    "bfwd",
+    "b/f",
+)
+
+
+def _is_opening_balance(p: Posting) -> bool:
+    """True for carry-forward / Vortrag rows (DE+EN)."""
+    attrs = p.attrs or {}
+    for key in ("BUCHUNGSTYP", "BUCHUNGSART", "PERIODENZUGEHÖRIGKEIT", "PERIODENZUGEHOERIGKEIT"):
+        raw = (attrs.get(key) or "").casefold()
+        if "vortrag" in raw or "opening" in raw or "brought forward" in raw:
+            return True
+    text = (p.text or "").casefold().strip()
+    if any(text.startswith(pref) for pref in _OPENING_TEXT_PREFIXES):
+        return True
+    # also match "Saldenvortrag ..." with leading noise
+    if "saldenvortrag" in text[:40]:
+        return True
+    return False
+
+
+def _economic_postings(dossier: Dossier) -> list[Posting]:
+    return [p for p in dossier.postings if not _is_opening_balance(p)]
 
 
 def _abs_amt(p: Posting) -> Decimal:
@@ -190,7 +220,7 @@ class BenfordLeadingDigits:
     family = LensFamily.STATISTICAL
 
     def run(self, dossier: Dossier) -> Iterable[Flag]:
-        postings = [p for p in dossier.postings if _abs_amt(p) > 0]
+        postings = [p for p in _economic_postings(dossier) if _abs_amt(p) > 0]
         if len(postings) < _MIN_BENFORD_N:
             return
 
@@ -293,7 +323,7 @@ class RoundNumberFrequency:
     family = LensFamily.STATISTICAL
 
     def run(self, dossier: Dossier) -> Iterable[Flag]:
-        postings = [p for p in dossier.postings if _abs_amt(p) > 0]
+        postings = [p for p in _economic_postings(dossier) if _abs_amt(p) > 0]
         if len(postings) < _MIN_GROUP_ROUND:
             return
 
@@ -363,7 +393,7 @@ class RobustOutliers:
     family = LensFamily.STATISTICAL
 
     def run(self, dossier: Dossier) -> Iterable[Flag]:
-        postings = [p for p in dossier.postings if _abs_amt(p) > 0]
+        postings = [p for p in _economic_postings(dossier) if _abs_amt(p) > 0]
         if len(postings) < _MIN_GROUP_OUTLIER:
             return
 
@@ -438,7 +468,7 @@ class DuplicatePayments:
 
     def run(self, dossier: Dossier) -> Iterable[Flag]:
         by_entity: dict[str, list[Posting]] = defaultdict(list)
-        for p in dossier.postings:
+        for p in _economic_postings(dossier):
             if not p.entity_id:
                 continue
             if _abs_amt(p) < _MIN_DUP_AMOUNT:
@@ -567,7 +597,7 @@ class AmountPrecisionCluster:
     family = LensFamily.STATISTICAL
 
     def run(self, dossier: Dossier) -> Iterable[Flag]:
-        postings = [p for p in dossier.postings if _abs_amt(p) > 0]
+        postings = [p for p in _economic_postings(dossier) if _abs_amt(p) > 0]
         if len(postings) < 50:
             return
 
