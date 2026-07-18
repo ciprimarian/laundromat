@@ -207,6 +207,121 @@ def _document_date(document: Document) -> date | None:
     )
 
 
+def _account_entity(posting: Posting, dossier: Dossier):
+    account_id = posting.attrs.get("account_base") or posting.account
+    entity = dossier.entities.get(account_id)
+    if entity is None or entity.type is not EntityType.ACCOUNT:
+        return None
+    return entity
+
+
+_GOODS_MARKERS = (
+    "rohstoff",
+    "hilfsstoff",
+    "betriebsstoff",
+    "material",
+    "handelsware",
+    "warenbestand",
+    "vorrat",
+    "wareneinkauf",
+    "materialeinkauf",
+    "materiallieferung",
+    "eingangsrechnung material",
+    "raw material",
+    "inventory",
+    "merchandise",
+    "goods purchase",
+    "purchase of goods",
+    "material purchase",
+    "material delivery",
+)
+
+_NON_GOODS_MARKERS = (
+    "dienstleistung",
+    "beratung",
+    "wartung",
+    "reparatur",
+    "instandhaltung",
+    "miete",
+    "leasing",
+    "energie",
+    "fracht",
+    "logistik",
+    "versicherung",
+    "steuer",
+    "gebuhr",
+    "wareneinsatz",
+    "umlagerung",
+    "umbuchung",
+    "fertigung",
+    "service",
+    "consulting",
+    "maintenance",
+    "repair",
+    "rent",
+    "utilities",
+    "freight",
+    "logistics",
+    "insurance",
+    "tax",
+    "cost of goods",
+    "cost of sales",
+    "cogs",
+    "internal transfer",
+    "reclassification",
+    "production transfer",
+)
+
+
+def _goods_procurement(posting: Posting, dossier: Dossier) -> bool:
+    if _is_vendor_payment(posting) or _is_opening_or_reversal(posting):
+        return False
+    narrative = _posting_text(posting)
+    entity = _account_entity(posting, dossier)
+    account_text = ""
+    account_class = AccountClass.OTHER
+    if entity is not None:
+        account_text = _norm(
+            " ".join([entity.name, *(str(value) for value in entity.attrs.values() if value)])
+        )
+        account_class = classify_account(entity.id, entity.name, entity.attrs)
+    combined = f"{account_text} {narrative}".strip()
+    if any(marker in combined for marker in _NON_GOODS_MARKERS):
+        return False
+    explicit_material = any(marker in narrative for marker in _GOODS_MARKERS)
+    classified_goods = account_class in {AccountClass.ASSET, AccountClass.EXPENSE} and any(
+        marker in account_text for marker in _GOODS_MARKERS
+    )
+    return explicit_material or classified_goods
+
+
+def _receipt_reference(document: Document) -> str | None:
+    return _field(
+        document,
+        "RECHNUNGSNUMMER",
+        "RECHNUNGS_NR",
+        "INVOICE_NUMBER",
+        "INVOICE_NO",
+        "INVOICE",
+        "BELEGNUMMER",
+        "DOCUMENT_NUMBER",
+        "DOC_NO",
+    )
+
+
+def _receipt_date(document: Document) -> date | None:
+    return document.doc_date or _parse_date(
+        _field(
+            document,
+            "WARENEINGANG_DATUM",
+            "WARENEINGANGSDATUM",
+            "GOODS_RECEIPT_DATE",
+            "RECEIPT_DATE",
+            "DATE",
+        )
+    )
+
+
 def _posting_field(posting: Posting, *aliases: str) -> str | None:
     fields = {_norm(key): str(value).strip() for key, value in posting.attrs.items()}
     for alias in aliases:
@@ -532,6 +647,102 @@ class NewVendorQuickPayment:
                 doc_no=payment.doc_no or None,
                 amount=amount,
                 confidence=0.78,
+            )
+
+
+@register
+class NoGoodsReceipt:
+    """K2: material goods payment with no matching goods receipt."""
+
+    # Practice set: 0 flags across 26,647 postings (0.000%).
+    lens_id = "K2_no_goods_receipt"
+    family = LensFamily.RULE
+
+    @staticmethod
+    def run(dossier: Dossier):
+        receipts = dossier.docs_of("goods_receipt")
+        usable_receipts = []
+        for receipt in receipts:
+            vendor_id = _document_vendor_id(receipt)
+            reference = _receipt_reference(receipt)
+            receipt_date = _receipt_date(receipt)
+            exact_usable = bool(vendor_id and reference)
+            fallback_usable = bool(
+                vendor_id and receipt.amount is not None and receipt_date is not None
+            )
+            if exact_usable or fallback_usable:
+                usable_receipts.append(
+                    (receipt, _norm_id(vendor_id), _norm(reference), receipt_date)
+                )
+        if not usable_receipts:
+            return
+
+        by_reference: dict[str, list[Posting]] = defaultdict(list)
+        for posting in dossier.postings:
+            reference = _norm(posting.doc_no)
+            if reference:
+                by_reference[reference].append(posting)
+
+        candidates: dict[tuple[str, str], list[Posting]] = defaultdict(list)
+        for posting in dossier.postings:
+            if (
+                not posting.entity_id
+                or not _is_vendor_payment(posting)
+                or _norm(posting.currency) != "eur"
+                or abs(posting.amount) <= JET_FLOOR
+            ):
+                continue
+            reference = _norm(posting.doc_no)
+            if not reference:
+                continue
+            entity = dossier.entities.get(posting.entity_id)
+            if entity is not None and entity.type is not EntityType.VENDOR:
+                continue
+            candidates[(_norm_id(posting.entity_id), reference)].append(posting)
+
+        for (vendor_id, reference), payments in candidates.items():
+            group = by_reference.get(reference, [])
+            goods_rows = [posting for posting in group if _goods_procurement(posting, dossier)]
+            if not goods_rows:
+                continue
+
+            matched = False
+            for receipt, receipt_vendor, receipt_reference, _ in usable_receipts:
+                if receipt_reference and receipt_reference == reference and receipt_vendor == vendor_id:
+                    matched = True
+                    break
+            if matched:
+                continue
+
+            payment = max(payments, key=lambda posting: abs(posting.amount))
+            amount = abs(payment.amount)
+            for receipt, receipt_vendor, _, receipt_date in usable_receipts:
+                if (
+                    receipt_vendor == vendor_id
+                    and receipt.amount is not None
+                    and abs(receipt.amount) == amount
+                    and receipt_date is not None
+                    and abs((receipt_date - payment.booking_date).days) <= 30
+                ):
+                    matched = True
+                    break
+            if matched:
+                continue
+
+            yield Flag(
+                lens_id=NoGoodsReceipt.lens_id,
+                family=NoGoodsReceipt.family,
+                title=f"Zahlung an Kreditor {payment.entity_id} ohne Wareneingang",
+                rationale=(
+                    f"Für die materialbezogene Zahlung {payment.doc_no} über {amount:.2f} "
+                    f"{payment.currency} wurde weder über die Rechnungsnummer noch über "
+                    "Kreditor, Betrag und 30-Tage-Fenster ein Wareneingang gefunden."
+                ),
+                evidence=_evidence(payments + goods_rows),
+                entity_id=payment.entity_id,
+                doc_no=payment.doc_no,
+                amount=amount,
+                confidence=0.84,
             )
 
 
