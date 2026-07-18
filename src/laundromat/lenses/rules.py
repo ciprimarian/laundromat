@@ -5,8 +5,9 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections import Counter, defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
+from math import ceil
 
 from ..contracts import (
     APPROVAL_LIMIT,
@@ -16,6 +17,7 @@ from ..contracts import (
     Flag,
     JET_FLOOR,
     LensFamily,
+    MATERIALITY,
     Posting,
     SourceRef,
     register,
@@ -77,6 +79,122 @@ def _evidence(postings: list[Posting]) -> tuple[SourceRef, ...]:
             seen.add(key)
             evidence.append(source)
     return tuple(evidence)
+
+
+def _gl_transactions(dossier: Dossier) -> list[list[Posting]]:
+    groups: dict[tuple[str, date, datetime | None, str | None], list[Posting]] = defaultdict(list)
+    for posting in dossier.postings:
+        if not _is_gl(posting):
+            continue
+        reference = posting.doc_no or (
+            f"@{posting.source.file}:{posting.source.line}:"
+            f"{posting.source.page}:{posting.source.sheet}"
+        )
+        key = (reference, posting.booking_date, posting.posted_at, posting.user)
+        groups[key].append(posting)
+    return list(groups.values())
+
+
+def _transaction_excluded(postings: list[Posting]) -> bool:
+    return any(_is_opening_or_reversal(posting) for posting in postings)
+
+
+def _transaction_amount(postings: list[Posting]) -> Decimal:
+    return max((abs(posting.amount) for posting in postings), default=Decimal(0))
+
+
+def _transaction_entity(postings: list[Posting]) -> str | None:
+    entity_ids = {posting.entity_id for posting in postings if posting.entity_id}
+    return next(iter(entity_ids)) if len(entity_ids) == 1 else None
+
+
+def _nearest_rank(values: list[int], percentile: float) -> int:
+    ordered = sorted(values)
+    index = max(0, ceil(percentile * len(ordered)) - 1)
+    return ordered[index]
+
+
+def _seconds_since_midnight(value: datetime) -> int:
+    return value.hour * 3600 + value.minute * 60 + value.second
+
+
+def _timing_bounds(transactions: list[list[Posting]]) -> tuple[int, int] | None:
+    baseline = [
+        _seconds_since_midnight(first.posted_at)
+        for postings in transactions
+        if not _transaction_excluded(postings)
+        and (first := postings[0]).posted_at is not None
+        and first.posted_at.weekday() < 5
+        and _norm(first.user) != "admin"
+    ]
+    if len(baseline) < 20:
+        return None
+    lower_quantile = _nearest_rank(baseline, 0.005)
+    upper_quantile = _nearest_rank(baseline, 0.995)
+    lower = lower_quantile // 3600 * 3600
+    upper = min(24 * 3600, (upper_quantile // 3600 + 1) * 3600)
+    return (lower, upper) if lower < upper else None
+
+
+def _easter_sunday(year: int) -> date:
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    ell = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * ell) // 451
+    month = (h + ell - 7 * m + 114) // 31
+    day = (h + ell - 7 * m + 114) % 31 + 1
+    return date(year, month, day)
+
+
+def _is_national_holiday(value: date) -> bool:
+    easter = _easter_sunday(value.year)
+    holidays = {
+        date(value.year, 1, 1),
+        easter - timedelta(days=2),
+        easter + timedelta(days=1),
+        date(value.year, 5, 1),
+        easter + timedelta(days=39),
+        easter + timedelta(days=50),
+        date(value.year, 10, 3),
+        date(value.year, 12, 25),
+        date(value.year, 12, 26),
+    }
+    return value in holidays
+
+
+_LOCK_DATE_FIELDS = {
+    _norm(alias)
+    for alias in (
+        "FESTSCHREIBUNGSDATUM",
+        "PERIODENSPERRDATUM",
+        "SPERRDATUM",
+        "ABSCHLUSSDATUM",
+        "PERIOD_LOCK_DATE",
+        "LOCK_DATE",
+        "CLOSE_DATE",
+        "CLOSED_AT",
+        "PERIOD_CLOSED_AT",
+    )
+}
+
+
+def _explicit_lock_date(postings: list[Posting]) -> date | None:
+    dates = [
+        parsed
+        for posting in postings
+        for key, value in posting.attrs.items()
+        if _norm(key) in _LOCK_DATE_FIELDS
+        if (parsed := _parse_date(str(value))) is not None
+    ]
+    return max(dates, default=None)
 
 
 def _source_evidence(*sources: SourceRef) -> tuple[SourceRef, ...]:
@@ -1059,4 +1177,169 @@ class RoundAmount:
                 doc_no=first.doc_no or None,
                 amount=amount,
                 confidence=0.45,
+            )
+
+
+@register
+class OddHoursAdmin:
+    """K7: unusual timing or a material transaction entered by Admin."""
+
+    # Practice set: 12 flags across 26,647 postings (0.045%).
+    lens_id = "K7_odd_hours_admin"
+    family = LensFamily.RULE
+
+    @staticmethod
+    def run(dossier: Dossier):
+        transactions = [
+            postings
+            for postings in _gl_transactions(dossier)
+            if not _transaction_excluded(postings)
+        ]
+        if not transactions:
+            return
+
+        timing_bounds = _timing_bounds(transactions)
+        timed = [postings for postings in transactions if postings[0].posted_at is not None]
+        weekend_rate = (
+            sum(postings[0].posted_at.weekday() >= 5 for postings in timed) / len(timed)
+            if timed
+            else 1.0
+        )
+        holiday_rate = (
+            sum(_is_national_holiday(postings[0].posted_at.date()) for postings in timed)
+            / len(timed)
+            if timed
+            else 1.0
+        )
+        rare_weekends = weekend_rate <= 0.05
+        rare_holidays = holiday_rate <= 0.01
+
+        for postings in transactions:
+            first = postings[0]
+            amount = _transaction_amount(postings)
+            admin = _norm(first.user) == "admin"
+            material_admin = (
+                admin and _norm(first.currency) == "eur" and amount >= MATERIALITY
+            )
+            odd_time = False
+            if first.posted_at is not None and timing_bounds is not None:
+                seconds = _seconds_since_midnight(first.posted_at)
+                odd_time = seconds < timing_bounds[0] or seconds >= timing_bounds[1]
+            rare_weekend = (
+                rare_weekends
+                and first.posted_at is not None
+                and first.posted_at.weekday() >= 5
+            )
+            rare_holiday = (
+                rare_holidays
+                and first.posted_at is not None
+                and _is_national_holiday(first.posted_at.date())
+            )
+            timing_signal = (odd_time or rare_weekend or rare_holiday) and (
+                admin or amount >= JET_FLOOR
+            )
+            if not (material_admin or timing_signal):
+                continue
+
+            reasons: list[str] = []
+            if material_admin:
+                reasons.append(f"Admin erfasste einen Betrag über {amount:.2f} {first.currency}")
+            if odd_time and first.posted_at is not None:
+                reasons.append(
+                    f"die Erfassung erfolgte um {first.posted_at:%H:%M:%S} außerhalb "
+                    "des empirischen Zeitfensters"
+                )
+            if rare_weekend:
+                reasons.append("die Erfassung erfolgte an einem im Dossier seltenen Wochenende")
+            if rare_holiday:
+                reasons.append("die Erfassung erfolgte an einem im Dossier seltenen Feiertag")
+            rationale = "; ".join(reasons)
+
+            yield Flag(
+                lens_id=OddHoursAdmin.lens_id,
+                family=OddHoursAdmin.family,
+                title=(
+                    f"Materielle Admin-Buchung: {first.doc_no}"
+                    if material_admin and len(reasons) == 1
+                    else f"Buchung zu ungewöhnlichem Zeitpunkt: {first.doc_no}"
+                ),
+                rationale=rationale[:1].upper() + rationale[1:] + ".",
+                evidence=_evidence(postings),
+                entity_id=_transaction_entity(postings),
+                doc_no=first.doc_no or None,
+                amount=amount,
+                confidence=0.3,
+            )
+
+
+@register
+class Backdating:
+    """Entry dates in the empirical lag tail or after an explicit period lock."""
+
+    # Practice set: 2 flags across 26,647 postings (0.008%).
+    lens_id = "backdating_entry_lag"
+    family = LensFamily.RULE
+    minimum_lag_days = 7
+    tail_percentile = 0.999
+
+    @staticmethod
+    def run(dossier: Dossier):
+        transactions = [
+            postings
+            for postings in _gl_transactions(dossier)
+            if not _transaction_excluded(postings)
+            and postings[0].posted_at is not None
+            and postings[0].posted_at.date() >= postings[0].booking_date
+        ]
+        if not transactions:
+            return
+
+        lags = [
+            (postings[0].posted_at.date() - postings[0].booking_date).days
+            for postings in transactions
+            if postings[0].posted_at is not None
+        ]
+        threshold = max(
+            Backdating.minimum_lag_days,
+            _nearest_rank(lags, Backdating.tail_percentile),
+        )
+
+        for postings in transactions:
+            first = postings[0]
+            if first.posted_at is None or _norm(first.currency) != "eur":
+                continue
+            amount = _transaction_amount(postings)
+            if amount < JET_FLOOR:
+                continue
+            lag = (first.posted_at.date() - first.booking_date).days
+            lock_date = _explicit_lock_date(postings)
+            locked_period = (
+                lock_date is not None
+                and first.booking_date <= lock_date < first.posted_at.date()
+            )
+            if lag <= threshold and not locked_period:
+                continue
+
+            if locked_period:
+                rationale = (
+                    f"Beleg {first.doc_no} wurde am {first.posted_at.date().isoformat()} "
+                    f"für den {first.booking_date.isoformat()} erfasst, obwohl ein "
+                    f"explizites Sperrdatum {lock_date.isoformat()} vorliegt."
+                )
+            else:
+                rationale = (
+                    f"Zwischen Buchungsdatum {first.booking_date.isoformat()} und "
+                    f"Erfassung am {first.posted_at.date().isoformat()} liegen {lag} Tage. "
+                    f"Der empirische Grenzwert beträgt {threshold} Tage."
+                )
+            yield Flag(
+                lens_id=Backdating.lens_id,
+                family=Backdating.family,
+                title=f"Rückdatierte Buchung: {first.doc_no}",
+                rationale=rationale,
+                evidence=_evidence(postings),
+                entity_id=_transaction_entity(postings),
+                doc_no=first.doc_no or None,
+                amount=amount,
+                confidence=0.85 if locked_period else 0.65,
             )

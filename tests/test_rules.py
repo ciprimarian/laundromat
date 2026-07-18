@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import unittest
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 from laundromat.contracts import Dossier, Document, Entity, EntityType, LensFamily, Posting, SourceRef
 from laundromat.lenses.rules import (
+    Backdating,
     CutoffViolation,
     NewVendorQuickPayment,
     NoGoodsReceipt,
+    OddHoursAdmin,
     RepairCapitalized,
     RoundAmount,
     SplitPayments,
@@ -29,6 +31,8 @@ def posting(
     booking_date: date = date(2025, 6, 1),
     entity_id: str | None = None,
     ledger: str = "GL",
+    posted_at: datetime | None = None,
+    user: str | None = None,
     account: str = "440000",
     attrs: dict[str, str] | None = None,
 ) -> Posting:
@@ -40,7 +44,9 @@ def posting(
         amount=Decimal(amount),
         account=account,
         source=source(line, f"{doc_no};{amount};{text}"),
+        posted_at=posted_at,
         entity_id=entity_id,
+        user=user,
         text=text,
         currency=currency,
         attrs=posting_attrs,
@@ -845,6 +851,242 @@ class RoundAmountTests(unittest.TestCase):
 
     def test_empty_dossier_is_safe(self):
         self.assertEqual(list(RoundAmount.run(Dossier(name="empty"))), [])
+
+
+class OddHoursAdminTests(unittest.TestCase):
+    def test_flags_material_admin_transaction_once_for_balanced_lines(self):
+        entered = datetime(2025, 6, 2, 12, 30)
+        dossier = Dossier(
+            name="admin",
+            postings=[
+                posting(
+                    "500000",
+                    line=10,
+                    doc_no="ADMIN-1",
+                    text="Fertigung Umlagerung",
+                    posted_at=entered,
+                    user="Admin",
+                ),
+                posting(
+                    "-500000",
+                    line=11,
+                    doc_no="ADMIN-1",
+                    text="Fertigung Umlagerung",
+                    posted_at=entered,
+                    user="Admin",
+                ),
+                posting(
+                    "500000",
+                    line=12,
+                    doc_no="USER-1",
+                    posted_at=entered,
+                    user="MV-U01",
+                ),
+                posting(
+                    "100",
+                    line=13,
+                    doc_no="ADMIN-ROUTINE",
+                    posted_at=entered,
+                    user="Admin",
+                ),
+            ],
+        )
+
+        flags = list(OddHoursAdmin.run(dossier))
+
+        self.assertEqual(len(flags), 1)
+        self.assertEqual(flags[0].lens_id, "K7_odd_hours_admin")
+        self.assertEqual(flags[0].doc_no, "ADMIN-1")
+        self.assertEqual(flags[0].amount, Decimal("500000"))
+        self.assertEqual(len(flags[0].evidence), 2)
+        self.assertEqual(flags[0].confidence, 0.3)
+
+    def test_derives_outward_rounded_business_hours(self):
+        workday = date(2025, 6, 2)
+        baseline = [
+            posting(
+                "100",
+                line=100 + index,
+                doc_no=f"BASE-{index}",
+                booking_date=workday,
+                posted_at=datetime(2025, 6, 2, 8 if index < 100 else 18),
+                user="MV-U01",
+            )
+            for index in range(200)
+        ]
+        night = posting(
+            "30000",
+            line=400,
+            doc_no="NIGHT-1",
+            booking_date=workday,
+            posted_at=datetime(2025, 6, 2, 23, 30),
+            user="MV-U02",
+        )
+
+        flags = list(OddHoursAdmin.run(Dossier(name="night", postings=baseline + [night])))
+
+        self.assertEqual(len(flags), 1)
+        self.assertEqual(flags[0].doc_no, "NIGHT-1")
+        self.assertEqual(flags[0].evidence, (night.source,))
+
+    def test_suppresses_common_weekends_and_opening_at_night(self):
+        weekday = [
+            posting(
+                "100",
+                line=500 + index,
+                doc_no=f"WEEKDAY-{index}",
+                booking_date=date(2025, 6, 2),
+                posted_at=datetime(2025, 6, 2, 12),
+                user="MV-U01",
+            )
+            for index in range(20)
+        ]
+        weekend = [
+            posting(
+                "30000",
+                line=600 + index,
+                doc_no=f"WEEKEND-{index}",
+                booking_date=date(2025, 6, 7),
+                posted_at=datetime(2025, 6, 7, 12),
+                user="MV-U01",
+            )
+            for index in range(20)
+        ]
+        opening = posting(
+            "500000",
+            line=700,
+            doc_no="AB-2024",
+            text="Opening balance",
+            booking_date=date(2025, 1, 1),
+            posted_at=datetime(2025, 1, 1, 23, 30),
+            user="Admin",
+        )
+
+        flags = list(
+            OddHoursAdmin.run(
+                Dossier(name="weekends", postings=weekday + weekend + [opening])
+            )
+        )
+
+        self.assertEqual(flags, [])
+
+    def test_empty_dossier_is_safe(self):
+        self.assertEqual(list(OddHoursAdmin.run(Dossier(name="empty"))), [])
+
+
+class BackdatingTests(unittest.TestCase):
+    def test_uses_strict_empirical_tail_and_groups_balanced_lines(self):
+        booking = date(2025, 1, 1)
+        baseline = [
+            posting(
+                "100",
+                line=1000 + index,
+                doc_no=f"NORMAL-{index}",
+                booking_date=booking,
+                posted_at=datetime(2025, 1, 1, 10),
+                user="MV-U01",
+            )
+            for index in range(1000)
+        ]
+        boundary = [
+            posting(
+                "30000",
+                line=2100,
+                doc_no="LAG-7",
+                booking_date=booking,
+                posted_at=datetime(2025, 1, 8, 10),
+                user="MV-U02",
+            ),
+            posting(
+                "30000",
+                line=2101,
+                doc_no="LAG-8",
+                booking_date=booking,
+                posted_at=datetime(2025, 1, 9, 10),
+                user="MV-U02",
+            ),
+        ]
+        bad = [
+            posting(
+                "86500",
+                line=2102,
+                doc_no="LAG-15",
+                booking_date=booking,
+                posted_at=datetime(2025, 1, 16, 10),
+                user="MV-U02",
+            ),
+            posting(
+                "-86500",
+                line=2103,
+                doc_no="LAG-15",
+                booking_date=booking,
+                posted_at=datetime(2025, 1, 16, 10),
+                user="MV-U02",
+            ),
+        ]
+
+        flags = list(
+            Backdating.run(Dossier(name="tail", postings=baseline + boundary + bad))
+        )
+
+        self.assertEqual(len(flags), 1)
+        self.assertEqual(flags[0].lens_id, "backdating_entry_lag")
+        self.assertEqual(flags[0].doc_no, "LAG-15")
+        self.assertEqual(flags[0].amount, Decimal("86500"))
+        self.assertEqual(len(flags[0].evidence), 2)
+
+    def test_requires_explicit_lock_date(self):
+        booked = date(2025, 1, 31)
+        entered = datetime(2025, 2, 2, 9)
+        locked = posting(
+            "30000",
+            line=2200,
+            doc_no="LOCKED",
+            booking_date=booked,
+            posted_at=entered,
+            attrs={"PERIOD_LOCK_DATE": "2025-01-31"},
+        )
+        status_only = posting(
+            "30000",
+            line=2201,
+            doc_no="STATUS-ONLY",
+            booking_date=booked,
+            posted_at=entered,
+            attrs={"FESTSCHREIBUNG": "Ja"},
+        )
+
+        flags = list(Backdating.run(Dossier(name="locks", postings=[locked, status_only])))
+
+        self.assertEqual(len(flags), 1)
+        self.assertEqual(flags[0].doc_no, "LOCKED")
+        self.assertIn("Sperrdatum", flags[0].rationale)
+
+    def test_ignores_opening_entries_and_low_value_tail(self):
+        dossier = Dossier(
+            name="safe",
+            postings=[
+                posting(
+                    "500000",
+                    line=2300,
+                    doc_no="AB-2024",
+                    text="Saldenvortrag",
+                    booking_date=date(2025, 1, 1),
+                    posted_at=datetime(2025, 1, 20, 9),
+                ),
+                posting(
+                    "1000",
+                    line=2301,
+                    doc_no="LOW",
+                    booking_date=date(2025, 1, 1),
+                    posted_at=datetime(2025, 1, 20, 9),
+                ),
+            ],
+        )
+
+        self.assertEqual(list(Backdating.run(dossier)), [])
+
+    def test_empty_dossier_is_safe(self):
+        self.assertEqual(list(Backdating.run(Dossier(name="empty"))), [])
 
 
 if __name__ == "__main__":
