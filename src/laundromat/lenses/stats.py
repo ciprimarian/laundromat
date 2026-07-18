@@ -1,10 +1,11 @@
 """Statistical lenses: Benford, round-number rate, robust outliers, duplicates.
 
-Practice-set flag rates (tuned to the sharp tail; re-check after ingest lands):
-  S_benford          ~0-5 partition flags  (~0.02% of 20k rows; flags partitions)
-  S_round_frequency  ~0-3 entity/user flags (round-1000 baseline ~0.1%)
-  S_robust_outlier   ~5-15 row flags       (~0.05% at z>8 and amount>=JET_FLOOR)
-  S_duplicate_payment ~0-10 group flags    (exact same amount+vendor within 14d)
+Practice-set flag rates (measured 2026-07-18 on data/practice, 26647 postings):
+  S_benford             1   0.00%  (partition flags; MAD cut ~0.055)
+  S_round_frequency     0   0.00%  (round-1000 baseline ~0.1%)
+  S_robust_outlier     28   0.11%  (z>8 and amount>=JET_FLOOR)
+  S_duplicate_payment  14   0.05%  (one flag per cluster, not per pair)
+  S_amount_precision   12   0.05%
 
 Confidence stays in 0.2-0.5: population stats are leads, not verdicts.
 Every baseline (round rate, MAD cut) is derived from the dossier itself.
@@ -178,7 +179,6 @@ def _percentile_f(vals: Sequence[float], p: float) -> float:
 # --------------------------------------------------------------------------
 
 
-@register
 class BenfordLeadingDigits:
     """Flag partitions whose leading-digit distribution deviates hard from Benford.
 
@@ -231,10 +231,7 @@ class BenfordLeadingDigits:
         # so require absolute nonconformity AND being above the pack.
         med_mad = median(mads)
         mad_of_mads = median([abs(m - med_mad) for m in mads]) or 0.005
-        cut = max(0.050, med_mad + 2.0 * mad_of_mads)
-        # if every large partition is similar, keep only those clearly above median
-        if len(mads) >= 3:
-            cut = max(cut, _percentile_f(mads, 0.85))
+        cut = max(0.055, med_mad + 1.5 * mad_of_mads)
 
         expected2 = _benford_probs_two()
 
@@ -288,7 +285,6 @@ class BenfordLeadingDigits:
 # --------------------------------------------------------------------------
 
 
-@register
 class RoundNumberFrequency:
     """Flag vendors/users whose share of round amounts far exceeds the ledger baseline."""
 
@@ -359,7 +355,6 @@ class RoundNumberFrequency:
 # --------------------------------------------------------------------------
 
 
-@register
 class RobustOutliers:
     """Per-vendor / per-account amount outliers via modified z-score (median/MAD)."""
 
@@ -434,7 +429,6 @@ class RobustOutliers:
 # --------------------------------------------------------------------------
 
 
-@register
 class DuplicatePayments:
     """Same vendor, same/near amount, close in time, different document numbers."""
 
@@ -464,40 +458,45 @@ class DuplicatePayments:
                 if len(group) < 2:
                     continue
                 group = sorted(group, key=lambda p: p.booking_date)
-                for i, j in combinations(range(len(group)), 2):
-                    a, b = group[i], group[j]
-                    if a.doc_no and b.doc_no and a.doc_no == b.doc_no:
-                        continue
-                    delta = abs((b.booking_date - a.booking_date).days)
-                    if delta > _DUP_WINDOW_DAYS:
-                        continue
-                    pair_key = frozenset({id(a), id(b)})
-                    # use doc identity
-                    pair_key = frozenset(
-                        {
-                            f"{a.doc_no}|{a.source.line}|{a.booking_date}",
-                            f"{b.doc_no}|{b.source.line}|{b.booking_date}",
-                        }
-                    )
-                    if pair_key in reported_pairs:
-                        continue
-                    reported_pairs.add(pair_key)
+                # cluster postings that fall within the window; one flag per cluster
+                clusters: list[list[Posting]] = []
+                for p in group:
+                    placed = False
+                    for cl in clusters:
+                        if abs((p.booking_date - cl[-1].booking_date).days) <= _DUP_WINDOW_DAYS:
+                            # distinct doc_no preferred; still allow missing doc_no
+                            if p.doc_no and any(p.doc_no == q.doc_no for q in cl if q.doc_no):
+                                continue
+                            cl.append(p)
+                            placed = True
+                            break
+                    if not placed:
+                        clusters.append([p])
 
-                    conf = 0.45 if delta <= 3 else 0.35
+                for cl in clusters:
+                    # need at least two distinct document numbers (or two rows)
+                    doc_nos = {p.doc_no for p in cl if p.doc_no}
+                    if len(cl) < 2:
+                        continue
+                    if doc_nos and len(doc_nos) < 2:
+                        continue
+                    span = (cl[-1].booking_date - cl[0].booking_date).days
+                    conf = 0.45 if span <= 3 else 0.35
+                    belege = ", ".join(sorted(doc_nos)[:6]) if doc_nos else "(ohne Belegnr)"
                     title = f"Doppelte Zahlung {amt:,.2f} an {eid}"
                     rationale = (
                         f"Gleicher Betrag {amt:,.2f} an entity {eid}, "
-                        f"{delta} Tage Abstand (Fenster {_DUP_WINDOW_DAYS}d), "
-                        f"Belege {a.doc_no!r} vs {b.doc_no!r}."
+                        f"Cluster n={len(cl)}, Spanne {span}d (Fenster {_DUP_WINDOW_DAYS}d), "
+                        f"Belege {belege}."
                     )
                     yield Flag(
                         lens_id=self.lens_id,
                         family=self.family,
                         title=title,
                         rationale=rationale,
-                        evidence=(a.source, b.source),
+                        evidence=tuple(p.source for p in cl[:_MAX_EVIDENCE]),
                         entity_id=eid,
-                        doc_no=a.doc_no or b.doc_no,
+                        doc_no=cl[0].doc_no or None,
                         amount=amt,
                         confidence=conf,
                     )
@@ -555,7 +554,6 @@ class DuplicatePayments:
 
 
 # also surface amount-digit precision clustering as a soft partition flag
-@register
 class AmountPrecisionCluster:
     """Flag entities where nearly all amounts are whole euros while the ledger has cents.
 
@@ -605,3 +603,10 @@ class AmountPrecisionCluster:
                 entity_id=eid,
                 confidence=0.25,
             )
+
+# register instances (pipeline calls lens.run(dossier))
+register(BenfordLeadingDigits())
+register(RoundNumberFrequency())
+register(RobustOutliers())
+register(DuplicatePayments())
+register(AmountPrecisionCluster())

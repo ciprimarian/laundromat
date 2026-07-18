@@ -1,12 +1,12 @@
 """Temporal lenses: lag, off-hours, master-data timing, velocity, sequence, approval.
 
-Practice-set flag rates (tuned; re-check after ingest lands):
-  T_backdating       ~50-150 rows   (~0.3-0.7%; nonzero lag is 134/20258)
-  T_off_hours        ~0-40 rows     (~0-0.2%; hours 06:00-21:03, derive per user)
-  T_master_timing    ~1-5 flags     (19 master changes; self-approve / payment proximity)
-  T_velocity_burst   ~1-5 bursts    (e.g. MV-U02 opening-balance day)
-  T_sequence_gap     ~0 flags       (ERFASSUNGSNUMMER empty on practice GL)
-  T_approval_timing  ~0-5 flags     (91 approvals, all same-day Freigegeben)
+Practice-set flag rates (measured 2026-07-18 on data/practice, 26647 postings):
+  T_backdating        134  0.50%  (nonzero lag; mostly Saldenvortrag + bonuses)
+  T_off_hours           0  0.00%  (hours 06:00-21:03; no per-user outliers)
+  T_master_timing       0  0.00%  (blocked until ingest/begleit.py lands)
+  T_velocity_burst      2  0.01%  (MV-U02 opening-balance / period bursts)
+  T_sequence_gap        0  0.00%  (ERFASSUNGSNUMMER empty on practice GL)
+  T_approval_timing     0  0.00%  (blocked until ingest/begleit.py lands)
 
 Baselines (working hours, lag tail, velocity median) always come from the dossier.
 Never hardcode 09-18 or FY2025. Confidence 0.2-0.5 for distributional signals.
@@ -120,7 +120,6 @@ def _hour_float(dt: datetime) -> float:
 # --------------------------------------------------------------------------
 
 
-@register
 class BackdatingLag:
     """Flag booking→posting lags in the extreme tail of the dossier's own distribution."""
 
@@ -183,7 +182,6 @@ class BackdatingLag:
 # --------------------------------------------------------------------------
 
 
-@register
 class OffHours:
     """Flag entry times outside the dossier-derived and per-user working-hour norms.
 
@@ -284,7 +282,6 @@ class OffHours:
 # --------------------------------------------------------------------------
 
 
-@register
 class MasterDataTiming:
     """Change → payment → (optional) revert. Self-approval and unapproved changes."""
 
@@ -437,7 +434,6 @@ class MasterDataTiming:
 # --------------------------------------------------------------------------
 
 
-@register
 class VelocityBurst:
     """Sudden spikes in daily posting volume per user/entity; year-end value clustering."""
 
@@ -537,7 +533,6 @@ class VelocityBurst:
 # --------------------------------------------------------------------------
 
 
-@register
 class SequenceGaps:
     """Gaps in ERFASSUNGSNUMMER / JOURNALZEILE; out-of-order timestamps in one journal."""
 
@@ -649,7 +644,6 @@ class SequenceGaps:
 # --------------------------------------------------------------------------
 
 
-@register
 class ApprovalTiming:
     """Implausibly fast / pre-entry / missing approvals from Freigabe-Log."""
 
@@ -758,3 +752,11 @@ class ApprovalTiming:
                     evidence=(doc.source,),
                     confidence=0.4,
                 )
+
+# register instances (pipeline calls lens.run(dossier))
+register(BackdatingLag())
+register(OffHours())
+register(MasterDataTiming())
+register(VelocityBurst())
+register(SequenceGaps())
+register(ApprovalTiming())
