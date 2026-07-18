@@ -20,6 +20,7 @@ from ..contracts import (
     SourceRef,
     register,
 )
+from ..ingest.accounts import AccountClass, classify_account
 
 
 def _norm(value: str | None) -> str:
@@ -206,6 +207,112 @@ def _document_date(document: Document) -> date | None:
     )
 
 
+_FIXED_ASSET_MARKERS = (
+    "anlagevermogen",
+    "sachanlage",
+    "grundstuck",
+    "gebaude",
+    "maschine",
+    "maschinelle anlage",
+    "anlagen im bau",
+    "betriebsausstattung",
+    "geschaftsausstattung",
+    "edv hardware",
+    "fixed asset",
+    "property plant equipment",
+    "property",
+    "plant",
+    "equipment",
+    "machinery",
+    "building",
+    "vehicle",
+    "construction in progress",
+)
+
+_ADDITION_MARKERS = (
+    "zugang",
+    "anlagezugang",
+    "anschaffung",
+    "aktivierung",
+    "erwerb",
+    "addition",
+    "acquisition",
+    "capitalization",
+    "capitalisation",
+)
+
+_DISPOSAL_MARKERS = (
+    "abgang",
+    "verausserung",
+    "abschreibung",
+    "afa",
+    "disposal",
+    "depreciation",
+    "amortization",
+    "amortisation",
+    "retirement",
+    "write off",
+)
+
+_REPAIR_RE = re.compile(
+    r"\b(?:reparatur|wartung|instandhaltung|instandsetzung|ersatzteile?|service|"
+    r"uberholung|ueberholung|generaluberholung|generalueberholung|austausch|repairs?|"
+    r"maintenance|servicing|refurbish(?:ment|ed|ing)?|overhauls?|spare parts?|"
+    r"replacements?)\b"
+)
+
+
+def _posting_text(posting: Posting) -> str:
+    return _norm(
+        " ".join(
+            [posting.text, *(str(value) for value in posting.attrs.values() if value)]
+        )
+    )
+
+
+def _fixed_asset_account(posting: Posting, dossier: Dossier) -> bool:
+    account_id = posting.attrs.get("account_base") or posting.account
+    entity = dossier.entities.get(account_id)
+    if entity is None:
+        candidates = [
+            candidate
+            for candidate in dossier.entities.values()
+            if candidate.type in {EntityType.ACCOUNT, EntityType.ASSET}
+            and posting.account.startswith(candidate.id)
+            and posting.account[len(candidate.id) : len(candidate.id) + 1]
+            in {"-", "/", ".", " "}
+        ]
+        entity = max(candidates, key=lambda candidate: len(candidate.id), default=None)
+    if entity is None:
+        return False
+    if entity.type is EntityType.ASSET:
+        return True
+    if entity.type is not EntityType.ACCOUNT:
+        return False
+    account_text = _norm(
+        " ".join([entity.name, *(str(value) for value in entity.attrs.values() if value)])
+    )
+    if not any(marker in account_text for marker in _FIXED_ASSET_MARKERS):
+        return False
+    return classify_account(entity.id, entity.name, entity.attrs) is AccountClass.ASSET
+
+
+def _fixed_asset_addition(posting: Posting, dossier: Dossier) -> bool:
+    if posting.amount == 0 or _is_opening_or_reversal(posting):
+        return False
+    text = _posting_text(posting)
+    if any(marker in text for marker in _DISPOSAL_MARKERS):
+        return False
+    return _fixed_asset_account(posting, dossier) and (
+        any(marker in text for marker in _ADDITION_MARKERS)
+        or bool(_REPAIR_RE.search(text))
+    )
+
+
+def _repair_narrative(posting: Posting) -> bool:
+    return bool(_REPAIR_RE.search(_posting_text(posting)))
+
+
 @register
 class NewVendorQuickPayment:
     """K1: a new or unregistered vendor paid unusually quickly."""
@@ -368,6 +475,62 @@ class NewVendorQuickPayment:
                 doc_no=payment.doc_no or None,
                 amount=amount,
                 confidence=0.78,
+            )
+
+
+@register
+class RepairCapitalized:
+    """K3: repair work recorded as a fixed-asset addition."""
+
+    # Practice set: 6 flags across 26,647 postings (0.023%).
+    lens_id = "K3_repair_capitalized"
+    family = LensFamily.RULE
+
+    @staticmethod
+    def run(dossier: Dossier):
+        groups: dict[str, list[Posting]] = defaultdict(list)
+        for posting in dossier.postings:
+            reference = posting.doc_no.strip().casefold()
+            if reference:
+                groups[reference].append(posting)
+
+        for postings in groups.values():
+            additions = [
+                posting
+                for posting in postings
+                if _fixed_asset_addition(posting, dossier)
+            ]
+            narratives = [
+                posting
+                for posting in postings
+                if not _is_opening_or_reversal(posting) and _repair_narrative(posting)
+            ]
+            if not additions or not narratives:
+                continue
+
+            first = additions[0]
+            amount = max(abs(posting.amount) for posting in additions)
+            vendor_ids = {
+                posting.entity_id
+                for posting in postings
+                if posting.entity_id
+                and (entity := dossier.entities.get(posting.entity_id)) is not None
+                and entity.type is EntityType.VENDOR
+            }
+            yield Flag(
+                lens_id=RepairCapitalized.lens_id,
+                family=RepairCapitalized.family,
+                title=f"Reparatur als Anlagezugang gebucht: {first.doc_no}",
+                rationale=(
+                    f"Beleg {first.doc_no} enthält einen Anlagezugang über {amount:.2f} "
+                    f"{first.currency}, während die Belegtexte Reparatur, Wartung oder "
+                    "Austausch beschreiben."
+                ),
+                evidence=_evidence(additions + narratives),
+                entity_id=next(iter(vendor_ids)) if len(vendor_ids) == 1 else None,
+                doc_no=first.doc_no,
+                amount=amount,
+                confidence=0.82,
             )
 
 
