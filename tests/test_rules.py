@@ -655,6 +655,13 @@ class CutoffViolationTests(unittest.TestCase):
             doc_date=date(2032, 1, 6),
             fields={"BUCHUNGSTEXT": "Payment receipt / settlement"},
         )
+        document_date_only = Document(
+            kind="purchase_invoice",
+            ref="NO-SERVICE-DATE",
+            source=SourceRef(file="support/invoices.csv", line=4, excerpt="NO-SERVICE-DATE"),
+            doc_date=date(2032, 1, 5),
+            fields={"BELEGDATUM": "20.12.2031"},
+        )
         dossier = Dossier(
             name="good",
             postings=[
@@ -670,8 +677,15 @@ class CutoffViolationTests(unittest.TestCase):
                     doc_no="ACCRUED-1",
                     booking_date=date(2031, 12, 31),
                 ),
+                posting(
+                    "50000",
+                    line=4,
+                    doc_no="ACCRUED-1",
+                    booking_date=date(2032, 1, 5),
+                    attrs={"BELEGDATUM": "20.12.2031"},
+                ),
             ],
-            documents=[accrued, same_year, cash],
+            documents=[accrued, same_year, cash, document_date_only],
         )
 
         self.assertEqual(list(CutoffViolation.run(dossier)), [])

@@ -368,8 +368,8 @@ def _performance_date(document: Document) -> date | None:
             "PERFORMANCE_DATE",
             "DELIVERY_DATE",
             "LIEFERDATUM",
-            "BELEGDATUM",
-            "DOCUMENT_DATE",
+            "SUPPLY_DATE",
+            "ECONOMIC_DATE",
         )
     )
 
@@ -912,6 +912,13 @@ class CutoffViolation:
                 continue
             reference = _reference(posting.doc_no)
             if reference and reference in flagged_references:
+                continue
+            if (
+                reference
+                and document_date.year == fiscal_year
+                and posting.booking_date.year == fiscal_year + 1
+                and reference in fiscal_references
+            ):
                 continue
             flagged_references.add(reference)
             amount = abs(posting.amount)
