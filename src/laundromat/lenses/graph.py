@@ -1,12 +1,13 @@
 """Graph lenses: pure-python entity/user joins (no cognee required).
 
-Practice-set flag rates (measured 2026-07-18, 26647 postings):
+Practice-set flag rates (calibrated post-scoring merge, 26647 postings):
   G_self_approval          1  0.00%  master self-approve (209101)
   G_orphan_user            0  0.00%  posters absent from permission matrix
   G_rights_violation       4  0.02%  MV-U11 stammdaten without right
   G_shared_identity        0  0.00%  vendor↔customer address/VAT
   G_near_vendor            1  0.00%  Titan Verpackung GmbH/KG
-  G_shareholder_link       2  0.01%  Muster Beteiligungs → 209113
+  G_shareholder_link       1  0.00%  Muster Beteiligungs → 209113
+  # all << 2% of rows; no further threshold cuts
 
 Family GRAPH. Confidence 0.35-0.7. Pure joins only; cognee deferred.
 """

@@ -1,6 +1,6 @@
 """Reconciliation lenses: documents that contradict each other.
 
-Practice-set flag rates (measured 2026-07-18, 26647 postings):
+Practice-set flag rates (calibrated post-scoring merge, 26647 postings):
   R_three_way               3  0.01%  GR without invoice (JET_FLOOR)
   R_sales_match             0  0.00%  sales invoice without goods issue
   R_credit_limit            0  0.00%  util > limit / util != saldo
@@ -9,6 +9,7 @@ Practice-set flag rates (measured 2026-07-18, 26647 postings):
   R_subledger_tie           0  0.00%  Abstimmung claims vs recomputed
   R_fs_tie                  0  0.00%  Jahresueberschuss Entwurf vs note
   R_bank                    0  0.00%  dormant (no bank docs on practice)
+  # all << 2% of rows; no further threshold cuts
 
 Arithmetic findings: confidence 0.55-0.85. Always cite BOTH sides in evidence.
 """
