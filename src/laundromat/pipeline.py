@@ -5,6 +5,7 @@ Usage: python -m laundromat.pipeline data/practice
 
 from __future__ import annotations
 
+import os
 import sys
 from collections import Counter
 
@@ -42,6 +43,14 @@ def run(path: str) -> tuple[Dossier, list[Flag], list[Finding]]:
         findings = score_all(flags)
     except NotImplementedError:
         pass  # scoring not written yet; flags still usable
+
+    if findings and os.environ.get("CORTEA_SKIP_DEFENSE") != "1":
+        try:
+            from .defense import run_defense
+
+            run_defense(findings, dossier)  # adjudicates REVIEW tier only
+        except Exception as e:
+            dossier.unparsed.append(("<defense>", f"{type(e).__name__}: {e}"))
     return dossier, flags, findings
 
 

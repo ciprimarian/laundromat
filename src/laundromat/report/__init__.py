@@ -15,12 +15,15 @@ import bisect
 import os
 import re
 import threading
+import uuid
+import zipfile
 from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from ..contracts import Dossier, Finding, Flag, SourceRef
@@ -30,18 +33,27 @@ DOSSIER_PATH = (
     or os.environ.get("DOSSIER_DIR")
     or "data/practice"
 )
+RUNS_DIR = Path(os.environ.get("CORTEA_RUNS_DIR") or "data/runs")
+MAX_UPLOAD = 300 * 1024 * 1024  # bytes, compressed
 
 CENT = Decimal("0.01")
 
-STATE: dict[str, Any] = {
-    "ready": False,
-    "error": None,
-    "dossier": None,
-    "flags": [],
-    "findings": [],
-    "index": None,
-}
+# One state dict per run id; "default" is the preloaded practice dossier.
+RUNS: dict[str, dict[str, Any]] = {}
 _LOCK = threading.Lock()
+
+
+def _new_state(name: str, path: str) -> dict[str, Any]:
+    return {
+        "ready": False,
+        "error": None,
+        "dossier": None,
+        "flags": [],
+        "findings": [],
+        "index": None,
+        "name": name,
+        "path": path,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -144,37 +156,53 @@ class TraceIndex:
 # --------------------------------------------------------------------------
 
 
-def _load() -> None:
+def _load(run_id: str) -> None:
+    with _LOCK:
+        state = RUNS[run_id]
     try:
         from ..pipeline import run
 
-        dossier, flags, findings = run(DOSSIER_PATH)
+        dossier, flags, findings = run(state["path"])
         index = TraceIndex(dossier)
         with _LOCK:
-            STATE.update(dossier=dossier, flags=flags, findings=findings, index=index)
+            state.update(dossier=dossier, flags=flags, findings=findings, index=index)
     except Exception as e:  # never let the server die on a bad dossier
         with _LOCK:
-            STATE["error"] = f"{type(e).__name__}: {e}"
+            state["error"] = f"{type(e).__name__}: {e}"
     finally:
         with _LOCK:
-            STATE["ready"] = True
+            state["ready"] = True
+
+
+def _start_run(run_id: str, name: str, path: str) -> None:
+    with _LOCK:
+        RUNS[run_id] = _new_state(name, path)
+    threading.Thread(target=_load, args=(run_id,), daemon=True).start()
 
 
 @asynccontextmanager
 async def _lifespan(_: FastAPI):
-    threading.Thread(target=_load, daemon=True).start()
+    _start_run("default", Path(DOSSIER_PATH).name, DOSSIER_PATH)
     yield
 
 
 app = FastAPI(title="Laundromat Bericht", lifespan=_lifespan)
 
 
-def _not_ready() -> JSONResponse | None:
+def _state(run: str) -> dict[str, Any] | None:
     with _LOCK:
-        if not STATE["ready"]:
-            return JSONResponse({"status": "loading", "dossier_path": DOSSIER_PATH})
-        if STATE["error"]:
-            return JSONResponse({"status": "error", "error": STATE["error"]})
+        return RUNS.get(run)
+
+
+def _not_ready(run: str) -> JSONResponse | None:
+    state = _state(run)
+    if state is None:
+        return JSONResponse({"status": "error", "error": f"unbekannter Lauf '{run}'"})
+    with _LOCK:
+        if not state["ready"]:
+            return JSONResponse({"status": "loading", "dossier_path": state["path"]})
+        if state["error"]:
+            return JSONResponse({"status": "error", "error": state["error"]})
     return None
 
 
@@ -270,12 +298,13 @@ def _group_flags_only(dossier: Dossier, flags: list[Flag]) -> list[dict]:
 
 
 @app.get("/api/findings")
-def api_findings():
-    if (r := _not_ready()) is not None:
+def api_findings(run: str = "default"):
+    if (r := _not_ready(run)) is not None:
         return r
-    dossier: Dossier = STATE["dossier"]
-    findings: list[Finding] = STATE["findings"]
-    flags: list[Flag] = STATE["flags"]
+    state = _state(run)
+    dossier: Dossier = state["dossier"]
+    findings: list[Finding] = state["findings"]
+    flags: list[Flag] = state["flags"]
     if findings:
         return {
             "status": "ready",
@@ -304,15 +333,16 @@ def _hit(src: SourceRef, matches: list[str], excerpt: str | None = None, label: 
 
 
 @app.get("/api/trace")
-def api_trace(q: str = ""):
-    if (r := _not_ready()) is not None:
+def api_trace(q: str = "", run: str = "default"):
+    if (r := _not_ready(run)) is not None:
         return r
     q = q.strip()
     if not q:
         return {"status": "ready", "query": q, "sections": [], "error": "Leere Anfrage"}
 
-    dossier: Dossier = STATE["dossier"]
-    index: TraceIndex = STATE["index"]
+    state = _state(run)
+    dossier: Dossier = state["dossier"]
+    index: TraceIndex = state["index"]
     ql = q.casefold()
 
     # Amount interpretation. Leading zero with no separators reads as an id,
@@ -454,11 +484,12 @@ def api_trace(q: str = ""):
 
 
 @app.get("/api/coverage")
-def api_coverage():
-    if (r := _not_ready()) is not None:
+def api_coverage(run: str = "default"):
+    if (r := _not_ready(run)) is not None:
         return r
-    dossier: Dossier = STATE["dossier"]
-    flags: list[Flag] = STATE["flags"]
+    state = _state(run)
+    dossier: Dossier = state["dossier"]
+    flags: list[Flag] = state["flags"]
 
     from ..contracts import REGISTRY
 
@@ -472,13 +503,13 @@ def api_coverage():
     return {
         "status": "ready",
         "dossier": dossier.name,
-        "dossier_path": DOSSIER_PATH,
+        "dossier_path": state["path"],
         "counts": {
             "postings": len(dossier.postings),
             "entities": len(dossier.entities),
             "documents": len(dossier.documents),
             "flags": len(flags),
-            "findings": len(STATE["findings"]),
+            "findings": len(state["findings"]),
         },
         "unparsed": [{"file": f, "reason": r} for f, r in dossier.unparsed],
         "lenses_failed": failed,
@@ -491,6 +522,54 @@ def api_coverage():
             sorted(Counter(p.attrs.get("ledger", "GL") for p in dossier.postings).items())
         ),
     }
+
+
+def _safe_extract(zf: zipfile.ZipFile, dest: Path) -> None:
+    """Extract while refusing paths that escape dest (zip slip)."""
+    base = dest.resolve()
+    for info in zf.infolist():
+        target = (dest / info.filename).resolve()
+        if base != target and base not in target.parents:
+            raise ValueError(f"unsicherer Pfad im Archiv: {info.filename}")
+    zf.extractall(dest)
+
+
+def _dossier_root(dest: Path) -> Path:
+    """A zip usually wraps everything in one folder; use it as the root."""
+    entries = [p for p in dest.iterdir() if not p.name.startswith(("__MACOSX", "."))]
+    if len(entries) == 1 and entries[0].is_dir():
+        return entries[0]
+    return dest
+
+
+@app.post("/upload")
+async def upload(files: list[UploadFile] = File(...)):
+    run_id = uuid.uuid4().hex[:8]
+    dest = RUNS_DIR / run_id
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        total = 0
+        saved: list[Path] = []
+        for uf in files:
+            name = Path(uf.filename or "upload.bin").name  # strip any client path
+            target = dest / name
+            with open(target, "wb") as out:
+                while chunk := await uf.read(1 << 20):
+                    total += len(chunk)
+                    if total > MAX_UPLOAD:
+                        raise ValueError("Upload ueberschreitet das Groessenlimit")
+                    out.write(chunk)
+            saved.append(target)
+        for path in saved:
+            if path.suffix.lower() == ".zip":
+                with zipfile.ZipFile(path) as zf:
+                    _safe_extract(zf, dest)
+                path.unlink()
+        root = _dossier_root(dest)
+        _start_run(run_id, root.name, str(root))
+        return {"status": "ok", "run": run_id}
+    except Exception as e:
+        return JSONResponse({"status": "error", "error": f"{type(e).__name__}: {e}"}, status_code=400)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -560,6 +639,10 @@ td.num { text-align:right; font-variant-numeric:tabular-nums; }
 .note { color:var(--mut); font-size:13px; margin:8px 0; }
 .err { color:var(--hi); }
 .hint { color:var(--mut); font-size:13px; margin-top:6px; }
+#dropzone { border:2px dashed var(--line); border-radius:8px; padding:8px 16px;
+            color:var(--mut); font-size:13px; cursor:pointer; user-select:none; }
+#dropzone.over { border-color:var(--acc); color:var(--acc); background:#eef4fb; }
+#dropzone.busy { border-style:solid; color:var(--acc); }
 </style>
 </head>
 <body>
@@ -567,6 +650,9 @@ td.num { text-align:right; font-variant-numeric:tabular-nums; }
   <h1>Laundromat Pruefbericht</h1>
   <span class="sub" id="dossiername"></span>
   <span class="sub" id="status"></span>
+  <span style="flex:1"></span>
+  <div id="dropzone" title="Dossier-Zip hierher ziehen oder klicken">Dossier pruefen: Zip hier ablegen</div>
+  <input type="file" id="filepick" multiple style="display:none">
 </header>
 <nav>
   <button id="tab-f" class="on" onclick="show('f')">Feststellungen</button>
@@ -590,6 +676,8 @@ td.num { text-align:right; font-variant-numeric:tabular-nums; }
 </main>
 <script>
 "use strict";
+const RUN = new URLSearchParams(location.search).get("run") || "default";
+function api(path){ return path + (path.includes("?") ? "&" : "?") + "run=" + encodeURIComponent(RUN); }
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,
   c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 function show(v){
@@ -623,7 +711,7 @@ function tog(el){
 }
 async function loadFindings(){
   const el = document.getElementById("view-f");
-  const d = await getJSON("/api/findings");
+  const d = await getJSON(api("/api/findings"));
   if(d.status==="loading"){ setTimeout(loadFindings,1500);
     el.innerHTML = `<div class="note">Dossier wird geladen (${esc(d.dossier_path)}) ...</div>`; return; }
   if(d.status==="error"){ el.innerHTML = `<div class="note err">Fehler: ${esc(d.error)}</div>`; return; }
@@ -651,7 +739,7 @@ async function trace(){
   const out = document.getElementById("traceout");
   if(!q){ out.innerHTML=""; return; }
   out.innerHTML = `<div class="note">Suche ...</div>`;
-  const d = await getJSON("/api/trace?q="+encodeURIComponent(q));
+  const d = await getJSON(api("/api/trace?q="+encodeURIComponent(q)));
   if(d.status!=="ready"){ out.innerHTML =
     `<div class="note err">${esc(d.error||"Dossier noch nicht geladen")}</div>`; return; }
   let h = d.amount?`<div class="note">Interpretiert als Betrag: <span class="amt">${esc(d.amount)} EUR</span></div>`:"";
@@ -670,7 +758,7 @@ async function trace(){
 }
 async function loadCoverage(){
   const el = document.getElementById("view-c");
-  const d = await getJSON("/api/coverage");
+  const d = await getJSON(api("/api/coverage"));
   if(d.status==="loading"){ setTimeout(loadCoverage,1500); return; }
   if(d.status==="error"){ el.innerHTML = `<div class="note err">Fehler: ${esc(d.error)}</div>`; return; }
   const c = d.counts;
@@ -700,6 +788,30 @@ async function loadCoverage(){
     d.unparsed.map(u=>`<tr><td>${esc(u.file)}</td><td class="err">${esc(u.reason)}</td></tr>`).join("")+
     `</table></div>` : `<div class="note">Alle Dateien verarbeitet.</div>`;
   el.innerHTML = h;
+}
+const dz = document.getElementById("dropzone");
+const fp = document.getElementById("filepick");
+dz.onclick = () => fp.click();
+fp.onchange = () => uploadFiles(fp.files);
+dz.ondragover = e => { e.preventDefault(); dz.classList.add("over"); };
+dz.ondragleave = () => dz.classList.remove("over");
+dz.ondrop = e => { e.preventDefault(); dz.classList.remove("over"); uploadFiles(e.dataTransfer.files); };
+async function uploadFiles(files){
+  if(!files || !files.length) return;
+  dz.classList.add("busy"); dz.textContent = "Wird hochgeladen ...";
+  const fd = new FormData();
+  for(const f of files) fd.append("files", f);
+  try{
+    const r = await fetch("/upload", {method:"POST", body:fd});
+    const d = await r.json();
+    if(d.status==="ok"){ location.search = "?run=" + encodeURIComponent(d.run); return; }
+    dz.textContent = "Fehler: " + (d.error||"Upload fehlgeschlagen");
+  }catch(err){ dz.textContent = "Fehler: " + err; }
+  dz.classList.remove("busy");
+  setTimeout(()=>{ dz.textContent = "Dossier pruefen: Zip hier ablegen"; }, 4000);
+}
+if(RUN !== "default"){
+  document.getElementById("status").textContent = "Lauf " + RUN;
 }
 loadFindings(); loadCoverage();
 </script>
