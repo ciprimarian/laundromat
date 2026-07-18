@@ -508,6 +508,11 @@ def api_coverage(run: str = "default"):
             "postings": len(dossier.postings),
             "entities": len(dossier.entities),
             "documents": len(dossier.documents),
+            "source_files": len(
+                {p.source.file for p in dossier.postings}
+                | {d.source.file for d in dossier.documents}
+                | {e.source.file for e in dossier.entities.values()}
+            ),
             "flags": len(flags),
             "findings": len(state["findings"]),
         },
@@ -582,11 +587,11 @@ def index_page():
 # --------------------------------------------------------------------------
 
 PAGE = r"""<!doctype html>
-<html lang="de">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Laundromat Pruefbericht</title>
+<title>Laundromat</title>
 <style>
 :root { --bg:#f6f7f9; --card:#ffffff; --ink:#1a232e; --mut:#5c6b7a; --line:#dde3ea;
         --acc:#0b5cad; --hi:#b42318; --med:#b54708; --rev:#5c6b7a; --ok:#067647; }
@@ -594,9 +599,14 @@ PAGE = r"""<!doctype html>
 body { background:var(--bg); color:var(--ink);
        font:15px/1.45 -apple-system,"Segoe UI",Roboto,Arial,sans-serif; }
 header { background:var(--card); border-bottom:1px solid var(--line);
-         padding:14px 24px; display:flex; align-items:baseline; gap:18px; }
-header h1 { font-size:18px; }
+         padding:12px 24px; display:flex; align-items:center; gap:18px; }
+header h1 { font-size:19px; line-height:1.1; }
+header .tag { color:var(--mut); font-size:12px; font-style:italic; }
 header .sub { color:var(--mut); font-size:13px; }
+.langbtn { border:1px solid var(--line); background:var(--card); color:var(--mut);
+           border-radius:6px; padding:6px 10px; font-size:12px; font-weight:600;
+           cursor:pointer; }
+.langbtn:hover { color:var(--acc); border-color:var(--acc); }
 nav { display:flex; gap:4px; padding:10px 24px 0; }
 nav button { border:1px solid var(--line); border-bottom:none; background:#eef1f5;
              padding:8px 18px; font-size:14px; cursor:pointer; border-radius:6px 6px 0 0; }
@@ -604,7 +614,7 @@ nav button.on { background:var(--card); font-weight:600; color:var(--acc); }
 main { padding:16px 24px 60px; max-width:1200px; }
 .card { background:var(--card); border:1px solid var(--line); border-radius:6px;
         margin-bottom:10px; }
-.row { padding:10px 14px; cursor:pointer; display:flex; gap:12px; align-items:baseline;
+.row { padding:10px 14px; cursor:pointer; display:flex; gap:12px; align-items:center;
        flex-wrap:wrap; }
 .row:hover { background:#f2f6fa; }
 .badge { display:inline-block; font-size:11px; padding:1px 8px; border-radius:9px;
@@ -623,6 +633,7 @@ main { padding:16px 24px 60px; max-width:1200px; }
 .flag .fbody { display:none; border-top:1px solid var(--line); padding:8px 12px; }
 .ev { margin:6px 0; }
 .cite { font:12px ui-monospace,Menlo,Consolas,monospace; color:var(--acc); }
+a.cite { cursor:pointer; text-decoration:underline dotted; }
 pre.x { font:12px ui-monospace,Menlo,Consolas,monospace; background:#f2f4f7;
         border:1px solid var(--line); border-radius:4px; padding:6px 8px; margin-top:3px;
         white-space:pre-wrap; word-break:break-all; }
@@ -643,36 +654,52 @@ td.num { text-align:right; font-variant-numeric:tabular-nums; }
             color:var(--mut); font-size:13px; cursor:pointer; user-select:none; }
 #dropzone.over { border-color:var(--acc); color:var(--acc); background:#eef4fb; }
 #dropzone.busy { border-style:solid; color:var(--acc); }
+.strip { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:14px; }
+.chip { border-radius:8px; padding:7px 14px; font-size:14px; background:var(--card);
+        border:1px solid var(--line); }
+.chip b { font-size:17px; margin-right:5px; }
+.chip.k { border-color:var(--hi); color:var(--hi); }
+.chip.m { border-color:var(--med); color:var(--med); }
+.chip.e { border-color:var(--ok); color:var(--ok); }
+.chip.p { color:var(--mut); }
+.strip .vol { color:var(--mut); font-size:13px; margin-left:auto; }
+.headline { font-size:15px; }
+.subline { margin-top:2px; font-size:13px; color:var(--mut); }
+.subline b { color:var(--ink); font-size:14px; }
+.score { margin-left:auto; text-align:right; font-variant-numeric:tabular-nums;
+         font-weight:600; color:var(--acc); white-space:nowrap; }
+.score .mut { display:block; font-weight:400; }
 </style>
 </head>
 <body>
 <header>
-  <h1>Laundromat Pruefbericht</h1>
+  <div>
+    <h1>Laundromat</h1>
+    <div class="tag">no number without a source</div>
+  </div>
   <span class="sub" id="dossiername"></span>
   <span class="sub" id="status"></span>
   <span style="flex:1"></span>
-  <div id="dropzone" title="Dossier-Zip hierher ziehen oder klicken">Dossier pruefen: Zip hier ablegen</div>
+  <button class="langbtn" id="langbtn" onclick="toggleLang()">DE</button>
+  <div id="dropzone" title=""></div>
   <input type="file" id="filepick" multiple style="display:none">
 </header>
 <nav>
-  <button id="tab-f" class="on" onclick="show('f')">Feststellungen</button>
-  <button id="tab-t" onclick="show('t')">Zahlenspur</button>
-  <button id="tab-c" onclick="show('c')">Abdeckung</button>
+  <button id="tab-f" class="on" onclick="show('f')"></button>
+  <button id="tab-t" onclick="show('t')"></button>
+  <button id="tab-c" onclick="show('c')"></button>
 </nav>
 <main>
-  <section id="view-f"><div class="note">Wird geladen ...</div></section>
+  <section id="view-f"><div class="note" id="loading-f"></div></section>
   <section id="view-t" style="display:none">
     <div style="display:flex;gap:8px;flex-wrap:wrap">
-      <input id="traceq" placeholder="Betrag (z.B. 19.729.014,76), Kontonummer, Beleg-Nr. oder Name"
-             onkeydown="if(event.key==='Enter')trace()">
-      <button id="tracebtn" onclick="trace()">Spur verfolgen</button>
+      <input id="traceq" onkeydown="if(event.key==='Enter')trace()">
+      <button id="tracebtn" onclick="trace()"></button>
     </div>
-    <div class="hint">Verfolgt jede Zahl vom Jahresabschluss ueber Saldenliste und Hauptbuch
-      bis in Nebenbuecher und Belege. Betraege in deutschem oder englischem Format,
-    exakt und &plusmn;1%.</div>
+    <div class="hint" id="tracehint"></div>
     <div id="traceout"></div>
   </section>
-  <section id="view-c" style="display:none"><div class="note">Wird geladen ...</div></section>
+  <section id="view-c" style="display:none"><div class="note"></div></section>
 </main>
 <script>
 "use strict";
@@ -680,6 +707,104 @@ const RUN = new URLSearchParams(location.search).get("run") || "default";
 function api(path){ return path + (path.includes("?") ? "&" : "?") + "run=" + encodeURIComponent(RUN); }
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,
   c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+
+// -------------------------------------------------------------- i18n chrome.
+// Lens output (titles, rationales, excerpts) is never translated.
+const I18N = {
+en: {
+  tab_f:"Findings", tab_t:"Figure Tracer", tab_c:"Coverage",
+  drop_idle:"Audit a dossier: drop zip here", drop_busy:"Uploading ...",
+  drop_fail:"Upload failed", run_label:"Run", err:"Error",
+  loading:"Loading dossier", critical:"critical", medium:"medium",
+  cleared:"checked & cleared", review:"under review",
+  postings:"postings", entities:"entities", docs_examined:"documents examined",
+  mode_note:"Scoring not active yet: sorted by number of independent audit methods and flags per subject.",
+  no_findings:"No findings.",
+  kind_entity:"Entity", kind_transaction:"Transaction", kind_lens:"Grouped",
+  method_one:"independent audit method", methods:"independent audit methods",
+  flag_one:"flag", flags:"flags", score:"Score",
+  defense:"Defense check", confidence:"Confidence",
+  sources:"Sources", sources_click:"click for original excerpt", no_excerpt:"(no excerpt)",
+  trace_ph:"Amount (e.g. 19.729.014,76), account, doc no. or name",
+  trace_btn:"Trace it",
+  trace_hint:"Traces any figure from the financial statements through trial balance and general ledger into subledgers and supporting documents. German or English number format, exact and \u00b11%.",
+  trace_searching:"Searching ...", trace_amount:"Interpreted as amount",
+  trace_hits:"hits", trace_first:"first", trace_shown:"shown", trace_none:"No hits for",
+  lenses:"Audit lenses", loaded:"loaded", failed:"failed",
+  th_lens:"Lens", th_family:"Family", th_flags:"Flags", th_module:"Module",
+  th_error:"Error", th_file:"File", th_reason:"Reason",
+  cov_docs:"Documents per kind", cov_ledger:"Postings per ledger",
+  cov_unparsed:"Unparsed files", cov_all:"All files parsed.",
+  c_postings:"postings", c_entities:"entities", c_documents:"documents",
+  c_flags:"flags", c_findings:"findings",
+  tier:{high:"critical", medium:"medium", review:"under review", dismissed:"cleared"},
+  fam:{rule:"Rule check", statistical:"Statistics", graph:"Graph analysis",
+       temporal:"Timing analysis", reconciliation:"Reconciliation",
+       semantic:"Semantics", external:"Web search"},
+  match:{"Betrag exakt":"Exact amount","Betrag \u00b11%":"Amount \u00b11%","Konto":"Account",
+         "Entit\u00e4t":"Entity","Beleg-Nr.":"Doc no.","Text":"Text","Feld":"Field"},
+  sec:{fs:"Financial statements", tb:"Trial balance", gl:"General ledger",
+       sub:"Subledgers (AP/AR/FA)", docs:"Supporting documents", ent:"Master data"},
+},
+de: {
+  tab_f:"Feststellungen", tab_t:"Zahlenspur", tab_c:"Abdeckung",
+  drop_idle:"Dossier pruefen: Zip hier ablegen", drop_busy:"Wird hochgeladen ...",
+  drop_fail:"Upload fehlgeschlagen", run_label:"Lauf", err:"Fehler",
+  loading:"Dossier wird geladen", critical:"kritisch", medium:"mittel",
+  cleared:"geprueft & entlastet", review:"in Pruefung",
+  postings:"Buchungen", entities:"Entitaeten", docs_examined:"Dokumente geprueft",
+  mode_note:"Scoring noch nicht aktiv: Sortierung nach Zahl unabhaengiger Pruefmethoden und Befunden je Subjekt.",
+  no_findings:"Keine Feststellungen.",
+  kind_entity:"Entitaet", kind_transaction:"Transaktion", kind_lens:"Sammelbefund",
+  method_one:"unabhaengige Pruefmethode", methods:"unabhaengige Pruefmethoden",
+  flag_one:"Befund", flags:"Befunde", score:"Score",
+  defense:"Entlastungspruefung", confidence:"Konfidenz",
+  sources:"Quellen", sources_click:"anklicken fuer Originalauszug", no_excerpt:"(kein Auszug)",
+  trace_ph:"Betrag (z.B. 19.729.014,76), Konto, Beleg-Nr. oder Name",
+  trace_btn:"Spur verfolgen",
+  trace_hint:"Verfolgt jede Zahl vom Jahresabschluss ueber Saldenliste und Hauptbuch bis in Nebenbuecher und Belege. Betraege in deutschem oder englischem Format, exakt und \u00b11%.",
+  trace_searching:"Suche ...", trace_amount:"Interpretiert als Betrag",
+  trace_hits:"Treffer", trace_first:"erste", trace_shown:"gezeigt", trace_none:"Keine Treffer fuer",
+  lenses:"Pruefmethoden", loaded:"geladen", failed:"fehlgeschlagen",
+  th_lens:"Lens", th_family:"Familie", th_flags:"Befunde", th_module:"Modul",
+  th_error:"Fehler", th_file:"Datei", th_reason:"Grund",
+  cov_docs:"Dokumente je Art", cov_ledger:"Buchungen je Buch",
+  cov_unparsed:"Nicht verarbeitete Dateien", cov_all:"Alle Dateien verarbeitet.",
+  c_postings:"Buchungen", c_entities:"Entitaeten", c_documents:"Dokumente",
+  c_flags:"Befunde", c_findings:"Feststellungen",
+  tier:{high:"kritisch", medium:"mittel", review:"in Pruefung", dismissed:"entlastet"},
+  fam:{rule:"Regelpruefung", statistical:"Statistik", graph:"Graphanalyse",
+       temporal:"Zeitanalyse", reconciliation:"Abstimmung",
+       semantic:"Semantik", external:"Websuche"},
+  match:{},
+  sec:{fs:"Jahresabschluss", tb:"Saldenliste", gl:"Hauptbuch",
+       sub:"Nebenbuecher (AP/AR/FA)", docs:"Belege und Dokumente", ent:"Stammdaten"},
+},
+};
+let LANG = localStorage.getItem("lang") || "en";
+function t(k){ const v = I18N[LANG][k]; return v!==undefined?v:(I18N.en[k]!==undefined?I18N.en[k]:k); }
+function tm(map, k){ const m = t(map); return (m && m[k]!==undefined)?m[k]:k; }
+function toggleLang(){
+  LANG = LANG==="en"?"de":"en";
+  localStorage.setItem("lang", LANG);
+  applyChrome(); loadFindings(); loadCoverage();
+  if(document.getElementById("traceq").value.trim()) trace();
+}
+function applyChrome(){
+  document.getElementById("langbtn").textContent = LANG==="en"?"DE":"EN";
+  document.getElementById("tab-f").textContent = t("tab_f");
+  document.getElementById("tab-t").textContent = t("tab_t");
+  document.getElementById("tab-c").textContent = t("tab_c");
+  const dz = document.getElementById("dropzone");
+  if(!dz.classList.contains("busy")) dz.textContent = t("drop_idle");
+  dz.title = t("drop_idle");
+  document.getElementById("traceq").placeholder = t("trace_ph");
+  document.getElementById("tracebtn").textContent = t("trace_btn");
+  document.getElementById("tracehint").textContent = t("trace_hint");
+  if(RUN !== "default")
+    document.getElementById("status").textContent = t("run_label") + " " + RUN;
+}
+
 function show(v){
   for(const k of ["f","t","c"]){
     document.getElementById("view-"+k).style.display = k===v?"":"none";
@@ -690,103 +815,127 @@ async function getJSON(url){
   const r = await fetch(url);
   return await r.json();
 }
+function deNum(s){ return s ? parseFloat(String(s).replace(/\./g,"").replace(",",".")) || 0 : 0; }
 function evHtml(refs){
-  return refs.map(e=>`<div class="ev"><span class="cite">${esc(e.cite)}`+
-    `${e.sheet?" ["+esc(e.sheet)+"]":""}</span>`+
-    `<pre class="x">${esc(e.excerpt)||"(kein Auszug)"}</pre></div>`).join("");
+  return refs.map(e=>`<div class="ev"><a class="cite" onclick="togNext(this)">${esc(e.cite)}`+
+    `${e.sheet?" ["+esc(e.sheet)+"]":""}</a>`+
+    `<pre class="x" style="display:none">${esc(e.excerpt)||esc(t("no_excerpt"))}</pre></div>`).join("");
 }
-function flagHtml(fl,i){
+function flagHtml(fl){
   const conf = Math.round(fl.confidence*100);
   return `<div class="flag"><div class="fhead" onclick="tog(this)">
-    <span class="badge m">${esc(fl.family)}</span> <b>${esc(fl.title)}</b>
-    <span class="mut">${esc(fl.lens_id)} | Konfidenz ${conf}%`+
-    `${fl.amount?" | <span class='amt'>"+esc(fl.amount)+" EUR</span>":""}</span></div>
+    <b>${esc(fl.title)}</b>
+    <div class="mut">${esc(tm("fam", fl.family))} \u00b7 ${esc(t("confidence"))} ${conf}%`+
+    `${fl.amount?" \u00b7 <span class='amt'>"+esc(fl.amount)+" EUR</span>":""}</div></div>
     <div class="fbody"><div>${esc(fl.rationale)}</div>
-    <div class="mut" style="margin-top:6px">Nachweise (${fl.evidence.length}):</div>
+    <div class="mut" style="margin-top:6px">${esc(t("sources"))} (${fl.evidence.length}) &ndash; ${esc(t("sources_click"))}:</div>
     ${evHtml(fl.evidence)}</div></div>`;
 }
 function tog(el){
   const b = el.parentElement.querySelector(".fbody, .body");
   if(b) b.style.display = b.style.display==="block"?"none":"block";
 }
+function togNext(a){
+  const p = a.nextElementSibling;
+  if(p) p.style.display = p.style.display==="none"?"block":"none";
+}
+function strongest(flags){
+  return flags.slice().sort((a,b)=>(b.confidence-a.confidence)||(deNum(b.amount)-deNum(a.amount)))[0];
+}
+function stripHtml(findings, counts){
+  const n = x => findings.filter(f=>f.tier===x).length;
+  const fmt = x => (x==null?"?":x.toLocaleString(LANG==="de"?"de-DE":"en-US"));
+  const rev = n("review");
+  return `<div class="strip">
+    <span class="chip k"><b>${n("high")}</b>${esc(t("critical"))}</span>
+    <span class="chip m"><b>${n("medium")}</b>${esc(t("medium"))}</span>
+    <span class="chip e"><b>${n("dismissed")}</b>${esc(t("cleared"))}</span>
+    ${rev?`<span class="chip p"><b>${rev}</b>${esc(t("review"))}</span>`:""}
+    <span class="vol">${fmt(counts.postings)} ${esc(t("postings"))}, ${fmt(counts.entities)} ${esc(t("entities"))},
+      ${fmt(counts.source_files)} ${esc(t("docs_examined"))}</span></div>`;
+}
 async function loadFindings(){
   const el = document.getElementById("view-f");
-  const d = await getJSON(api("/api/findings"));
+  const [d, cov] = await Promise.all([getJSON(api("/api/findings")), getJSON(api("/api/coverage"))]);
   if(d.status==="loading"){ setTimeout(loadFindings,1500);
-    el.innerHTML = `<div class="note">Dossier wird geladen (${esc(d.dossier_path)}) ...</div>`; return; }
-  if(d.status==="error"){ el.innerHTML = `<div class="note err">Fehler: ${esc(d.error)}</div>`; return; }
+    el.innerHTML = `<div class="note">${esc(t("loading"))} (${esc(d.dossier_path)}) ...</div>`; return; }
+  if(d.status==="error"){ el.innerHTML = `<div class="note err">${esc(t("err"))}: ${esc(d.error)}</div>`; return; }
   document.getElementById("dossiername").textContent = d.dossier;
-  const mode = d.mode==="scored" ? "" :
-    `<div class="note">Scoring noch nicht aktiv: Sortierung nach Zahl unabhaengiger`+
-    ` Lens-Familien und Flag-Anzahl je Subjekt.</div>`;
-  const kinds = {entity:"Entitaet", transaction:"Transaktion", lens:"Lens"};
-  el.innerHTML = mode + (d.findings.length? d.findings.map(f=>{
-    const name = f.subject_name?` <span class="mut">${esc(f.subject_name)}</span>`:"";
-    const tier = f.tier?`<span class="badge tier-${esc(f.tier)}">${esc(f.tier)}</span>`:"";
-    const score = f.score!=null?`<span class="mut">Score ${f.score.toFixed(2)}</span>`:"";
+  const counts = cov.status==="ready" ? cov.counts : {};
+  const kindKey = {entity:"kind_entity", transaction:"kind_transaction", lens:"kind_lens"};
+  const mode = d.mode==="scored" ? "" : `<div class="note">${esc(t("mode_note"))}</div>`;
+  el.innerHTML = stripHtml(d.findings, counts) + mode + (d.findings.length? d.findings.map(f=>{
+    const top = strongest(f.flags);
+    const tier = f.tier?`<span class="badge tier-${esc(f.tier)}">${esc(tm("tier", f.tier))}</span>`:"";
+    const name = f.subject_name || f.subject_id;
+    const idpart = f.subject_name?`<span class="mut">${esc(f.subject_id)} \u00b7 </span>`:"";
+    const fams = `${f.families.length} ${esc(f.families.length===1?t("method_one"):t("methods"))}`;
+    const nf = `${f.flag_count} ${esc(f.flag_count===1?t("flag_one"):t("flags"))}`;
+    const score = f.score!=null?`<div class="score">${f.score.toFixed(2).replace(".", LANG==="de"?",":".")}<span class="mut">${esc(t("score"))}</span></div>`:"";
     return `<div class="card"><div class="row" onclick="tog(this)">
-      ${tier}<b>${esc(f.subject_id)}</b>${name}
-      <span class="badge">${esc(kinds[f.subject_kind]||f.subject_kind)}</span>
-      ${f.families.map(x=>`<span class="badge m">${esc(x)}</span>`).join(" ")}
-      <span class="mut">${f.flag_count} Flag${f.flag_count===1?"":"s"}</span>
-      ${f.max_amount?`<span class="amt">${esc(f.max_amount)} EUR</span>`:""} ${score}</div>
-      <div class="body">${f.defense_note?`<div class="note">Entlastung: ${esc(f.defense_note)}</div>`:""}
+      <div style="flex:1;min-width:0">
+        <div class="headline">${tier} <b>${esc(top?top.title:"")}</b></div>
+        <div class="subline"><b>${esc(name)}</b> \u00b7 ${idpart}${esc(t(kindKey[f.subject_kind]||"")||f.subject_kind)}
+          \u00b7 ${fams} \u00b7 ${nf}
+          ${f.max_amount?`\u00b7 <span class="amt">${esc(f.max_amount)} EUR</span>`:""}</div>
+      </div>${score}</div>
+      <div class="body">${f.defense_note?`<div class="note">${esc(t("defense"))}: ${esc(f.defense_note)}</div>`:""}
       ${f.flags.map(flagHtml).join("")}</div></div>`;
-  }).join("") : `<div class="note">Keine Feststellungen.</div>`);
+  }).join("") : `<div class="note">${esc(t("no_findings"))}</div>`);
 }
 async function trace(){
   const q = document.getElementById("traceq").value.trim();
   const out = document.getElementById("traceout");
   if(!q){ out.innerHTML=""; return; }
-  out.innerHTML = `<div class="note">Suche ...</div>`;
+  out.innerHTML = `<div class="note">${esc(t("trace_searching"))}</div>`;
   const d = await getJSON(api("/api/trace?q="+encodeURIComponent(q)));
   if(d.status!=="ready"){ out.innerHTML =
-    `<div class="note err">${esc(d.error||"Dossier noch nicht geladen")}</div>`; return; }
-  let h = d.amount?`<div class="note">Interpretiert als Betrag: <span class="amt">${esc(d.amount)} EUR</span></div>`:"";
+    `<div class="note err">${esc(d.error||t("loading"))}</div>`; return; }
+  let h = d.amount?`<div class="note">${esc(t("trace_amount"))}: <span class="amt">${esc(d.amount)} EUR</span></div>`:"";
   let any=false;
   for(const s of d.sections){
     if(!s.total) continue; any=true;
-    h += `<h2 class="sec">${esc(s.label)} <span class="mut">(${s.total} Treffer`+
-      `${s.total>s.hits.length?", erste "+s.hits.length+" gezeigt":""})</span></h2>`;
+    h += `<h2 class="sec">${esc(tm("sec", s.id))} <span class="mut">(${s.total} ${esc(t("trace_hits"))}`+
+      `${s.total>s.hits.length?", "+esc(t("trace_first"))+" "+s.hits.length+" "+esc(t("trace_shown")):""})</span></h2>`;
     h += s.hits.map(x=>`<div class="card"><div class="row" style="cursor:default">
-      ${x.match.map(m=>`<span class="badge m">${esc(m)}</span>`).join(" ")}
+      ${x.match.map(m=>`<span class="badge m">${esc(tm("match", m))}</span>`).join(" ")}
       ${x.label?`<span>${esc(x.label)}</span>`:""}
       <span class="cite">${esc(x.cite)}${x.sheet?" ["+esc(x.sheet)+"]":""}</span></div>
-      <div style="padding:0 14px 10px"><pre class="x">${esc(x.excerpt)||"(kein Auszug)"}</pre></div></div>`).join("");
+      <div style="padding:0 14px 10px"><pre class="x">${esc(x.excerpt)||esc(t("no_excerpt"))}</pre></div></div>`).join("");
   }
-  out.innerHTML = h + (any?"":`<div class="note">Keine Treffer fuer "${esc(d.query)}".</div>`);
+  out.innerHTML = h + (any?"":`<div class="note">${esc(t("trace_none"))} "${esc(d.query)}".</div>`);
 }
 async function loadCoverage(){
   const el = document.getElementById("view-c");
   const d = await getJSON(api("/api/coverage"));
   if(d.status==="loading"){ setTimeout(loadCoverage,1500); return; }
-  if(d.status==="error"){ el.innerHTML = `<div class="note err">Fehler: ${esc(d.error)}</div>`; return; }
+  if(d.status==="error"){ el.innerHTML = `<div class="note err">${esc(t("err"))}: ${esc(d.error)}</div>`; return; }
   const c = d.counts;
   let h = `<div class="card"><div class="row" style="cursor:default">
     <b>${esc(d.dossier)}</b><span class="mut">${esc(d.dossier_path)}</span>
-    <span class="badge">${c.postings} Buchungen</span>
-    <span class="badge">${c.entities} Entitaeten</span>
-    <span class="badge">${c.documents} Dokumente</span>
-    <span class="badge">${c.flags} Flags</span>
-    <span class="badge">${c.findings} Feststellungen</span></div></div>`;
-  h += `<h2 class="sec">Lenses (${d.lenses.length} geladen, ${d.lenses_failed.length} fehlgeschlagen)</h2>
-    <div class="card"><table><tr><th>Lens</th><th>Familie</th><th>Flags</th></tr>`+
-    d.lenses.map(l=>`<tr><td>${esc(l.lens_id)}</td><td>${esc(l.family)}</td>
+    <span class="badge">${c.postings} ${esc(t("c_postings"))}</span>
+    <span class="badge">${c.entities} ${esc(t("c_entities"))}</span>
+    <span class="badge">${c.documents} ${esc(t("c_documents"))}</span>
+    <span class="badge">${c.flags} ${esc(t("c_flags"))}</span>
+    <span class="badge">${c.findings} ${esc(t("c_findings"))}</span></div></div>`;
+  h += `<h2 class="sec">${esc(t("lenses"))} (${d.lenses.length} ${esc(t("loaded"))}, ${d.lenses_failed.length} ${esc(t("failed"))})</h2>
+    <div class="card"><table><tr><th>${esc(t("th_lens"))}</th><th>${esc(t("th_family"))}</th><th>${esc(t("th_flags"))}</th></tr>`+
+    d.lenses.map(l=>`<tr><td>${esc(l.lens_id)}</td><td>${esc(tm("fam", l.family))}</td>
       <td class="num">${l.flags}</td></tr>`).join("")+`</table></div>`;
   if(d.lenses_failed.length)
-    h += `<div class="card"><table><tr><th>Modul</th><th>Fehler</th></tr>`+
+    h += `<div class="card"><table><tr><th>${esc(t("th_module"))}</th><th>${esc(t("th_error"))}</th></tr>`+
       d.lenses_failed.map(l=>`<tr><td>${esc(l.module)}</td><td class="err">${esc(l.reason)}</td></tr>`).join("")+
       `</table></div>`;
-  h += `<h2 class="sec">Dokumente je Art</h2><div class="card"><table>`+
+  h += `<h2 class="sec">${esc(t("cov_docs"))}</h2><div class="card"><table>`+
     Object.entries(d.documents_per_kind).map(([k,v])=>
       `<tr><td>${esc(k)}</td><td class="num">${v}</td></tr>`).join("")+`</table></div>`;
-  h += `<h2 class="sec">Buchungen je Buch</h2><div class="card"><table>`+
+  h += `<h2 class="sec">${esc(t("cov_ledger"))}</h2><div class="card"><table>`+
     Object.entries(d.postings_per_ledger).map(([k,v])=>
       `<tr><td>${esc(k)}</td><td class="num">${v}</td></tr>`).join("")+`</table></div>`;
-  h += `<h2 class="sec">Nicht verarbeitete Dateien (${d.unparsed.length})</h2>`;
-  h += d.unparsed.length?`<div class="card"><table><tr><th>Datei</th><th>Grund</th></tr>`+
+  h += `<h2 class="sec">${esc(t("cov_unparsed"))} (${d.unparsed.length})</h2>`;
+  h += d.unparsed.length?`<div class="card"><table><tr><th>${esc(t("th_file"))}</th><th>${esc(t("th_reason"))}</th></tr>`+
     d.unparsed.map(u=>`<tr><td>${esc(u.file)}</td><td class="err">${esc(u.reason)}</td></tr>`).join("")+
-    `</table></div>` : `<div class="note">Alle Dateien verarbeitet.</div>`;
+    `</table></div>` : `<div class="note">${esc(t("cov_all"))}</div>`;
   el.innerHTML = h;
 }
 const dz = document.getElementById("dropzone");
@@ -798,21 +947,19 @@ dz.ondragleave = () => dz.classList.remove("over");
 dz.ondrop = e => { e.preventDefault(); dz.classList.remove("over"); uploadFiles(e.dataTransfer.files); };
 async function uploadFiles(files){
   if(!files || !files.length) return;
-  dz.classList.add("busy"); dz.textContent = "Wird hochgeladen ...";
+  dz.classList.add("busy"); dz.textContent = t("drop_busy");
   const fd = new FormData();
   for(const f of files) fd.append("files", f);
   try{
     const r = await fetch("/upload", {method:"POST", body:fd});
     const d = await r.json();
     if(d.status==="ok"){ location.search = "?run=" + encodeURIComponent(d.run); return; }
-    dz.textContent = "Fehler: " + (d.error||"Upload fehlgeschlagen");
-  }catch(err){ dz.textContent = "Fehler: " + err; }
+    dz.textContent = t("err") + ": " + (d.error||t("drop_fail"));
+  }catch(err){ dz.textContent = t("err") + ": " + err; }
   dz.classList.remove("busy");
-  setTimeout(()=>{ dz.textContent = "Dossier pruefen: Zip hier ablegen"; }, 4000);
+  setTimeout(()=>{ dz.textContent = t("drop_idle"); }, 4000);
 }
-if(RUN !== "default"){
-  document.getElementById("status").textContent = "Lauf " + RUN;
-}
+applyChrome();
 loadFindings(); loadCoverage();
 </script>
 </body>
