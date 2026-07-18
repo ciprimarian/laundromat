@@ -5,6 +5,7 @@ Usage: python -m laundromat.pipeline data/practice
 
 from __future__ import annotations
 
+import os
 import sys
 from collections import Counter
 
@@ -19,6 +20,8 @@ def run_lenses(dossier: Dossier) -> tuple[list[Flag], dict[str, str]]:
     errors: dict[str, str] = {}
     for lens_id, lens in sorted(REGISTRY.items()):
         try:
+            if isinstance(lens, type):
+                lens = lens()  # registered as a class, run wants an instance
             flags.extend(lens.run(dossier))
         except Exception as e:
             errors[lens_id] = f"{type(e).__name__}: {e}"
@@ -40,6 +43,14 @@ def run(path: str) -> tuple[Dossier, list[Flag], list[Finding]]:
         findings = score_all(flags)
     except NotImplementedError:
         pass  # scoring not written yet; flags still usable
+
+    if findings and os.environ.get("CORTEA_SKIP_DEFENSE") != "1":
+        try:
+            from .defense import run_defense
+
+            run_defense(findings, dossier)  # adjudicates REVIEW tier only
+        except Exception as e:
+            dossier.unparsed.append(("<defense>", f"{type(e).__name__}: {e}"))
     return dossier, flags, findings
 
 

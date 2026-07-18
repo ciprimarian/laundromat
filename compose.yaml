@@ -1,11 +1,16 @@
 services:
   laundromat:
     build: .
-    ports:
-      - "80:8000"
+    container_name: laundromat
     env_file: .env
     volumes:
-      - ./data:/app/data:ro
+      - ./data:/app/data
     environment:
       - DOSSIER_DIR=/app/data/practice
     restart: unless-stopped
+    networks:
+      - staging
+
+networks:
+  staging:
+    external: true
