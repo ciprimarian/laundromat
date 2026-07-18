@@ -362,6 +362,8 @@ class _Core:
             pass
         if not os.environ.get("OPENAI_API_KEY"):
             return
+        # cognee reads its own env name, not OPENAI_API_KEY
+        os.environ.setdefault("LLM_API_KEY", os.environ["OPENAI_API_KEY"])
         lines, keys = self._candidates()
         if not lines:
             return
