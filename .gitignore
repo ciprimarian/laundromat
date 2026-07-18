@@ -1,6 +1,7 @@
-briefs/
-data/
+briefs
+data
 .env
+.entire/
 __pycache__/
 *.pyc
 .cache/
