@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import io
+import time
 import zipfile
 from datetime import date
 from decimal import Decimal
-from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from laundromat.contracts import (
+    Document,
     Dossier,
     Entity,
     EntityType,
@@ -22,7 +23,7 @@ from laundromat.contracts import (
     SourceRef,
     Tier,
 )
-from laundromat.report import STATE, TraceIndex, _LOCK, app
+from laundromat.report import RUNS, TraceIndex, _LOCK, _new_state, app
 
 
 KNOWN_AMOUNT = Decimal("19729014.76")
@@ -55,8 +56,6 @@ def _mini_dossier() -> Dossier:
         text="Anlage Zugang",
         attrs={"ledger": "GL"},
     )
-    from laundromat.contracts import Document
-
     doc = Document(
         kind="financial_statements",
         ref="draft",
@@ -72,7 +71,7 @@ def _mini_dossier() -> Dossier:
     )
 
 
-def _seed_state(dossier: Dossier | None = None) -> Dossier:
+def _seed_default_run(dossier: Dossier | None = None) -> Dossier:
     d = dossier or _mini_dossier()
     flag = Flag(
         lens_id="S_robust_outlier",
@@ -92,33 +91,50 @@ def _seed_state(dossier: Dossier | None = None) -> Dossier:
         tier=Tier.HIGH,
         score=4.2,
     )
+    state = _new_state("mini", "tests/fixture-mini")
+    state.update(
+        ready=True,
+        dossier=d,
+        flags=[flag],
+        findings=[finding],
+        index=TraceIndex(d),
+    )
     with _LOCK:
-        STATE.update(
-            ready=True,
-            error=None,
-            dossier=d,
-            flags=[flag],
-            findings=[finding],
-            index=TraceIndex(d),
-            run_id=None,
-            dossier_path="tests/fixture-mini",
-        )
+        RUNS["default"] = state
     return d
 
 
 @pytest.fixture
 def client(monkeypatch, tmp_path):
-    """TestClient without background practice load; STATE seeded with mini dossier."""
+    """TestClient with the default practice load replaced by the mini fixture;
+    uploaded runs still go through the real pipeline."""
+    import laundromat.report as report
 
-    def _noop_load() -> None:
-        _seed_state()
+    real_load = report._load
 
-    monkeypatch.setattr("laundromat.report._load", _noop_load)
+    def _fake_load(run_id: str) -> None:
+        if run_id == "default":
+            _seed_default_run()
+        else:
+            real_load(run_id)
+
+    monkeypatch.setattr("laundromat.report._load", _fake_load)
     monkeypatch.setattr("laundromat.report.RUNS_DIR", tmp_path / "runs")
-    # also patch module-level DOSSIER_PATH usage in coverage via STATE
     with TestClient(app) as c:
-        _seed_state()  # ensure after lifespan
+        _seed_default_run()  # ensure after lifespan
         yield c
+
+
+def _wait_ready(client: TestClient, run_id: str, timeout: float = 60.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        d = client.get("/api/coverage", params={"run": run_id}).json()
+        if d.get("status") == "ready":
+            return d
+        if d.get("status") == "error":
+            return d
+        time.sleep(0.25)
+    raise AssertionError(f"run {run_id} never became ready")
 
 
 def test_leaderboard_page_200_and_findings(client: TestClient):
@@ -149,46 +165,68 @@ def test_trace_resolves_known_amount(client: TestClient):
     sections = data.get("sections") or []
     total_hits = sum(s.get("total", 0) for s in sections)
     assert total_hits >= 1, f"expected hits for {q}, got {data}"
-    # at least one section should surface the GL or FS hit
-    assert any(s.get("total", 0) > 0 for s in sections)
 
 
-def test_upload_zip_creates_run(client: TestClient, tmp_path, monkeypatch):
-    # build a tiny zip that ingest can open (empty-ish but valid directory tree)
+def test_upload_zip_creates_run(client: TestClient):
+    """A zip upload creates a new run without touching the default run.
+
+    The upload endpoint kicks off the real pipeline in a thread; the mini
+    dossier has no GDPdU tables, which must not crash anything."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr(
             "mini_dossier/readme.txt",
             "not a full gdpdu; pipeline should still create a run\n",
         )
-        # one begleit-style csv so documents may load
         zf.writestr(
             "mini_dossier/credit_limits.csv",
             "DEBITOR;DEBITORNAME;KREDITLIMIT_EUR;AUSNUTZUNG_31_12_2025_EUR;STATUS;BESICHERUNG\n"
             "100000;TEST CO;10000,00;500,00;ok;none\n",
         )
-    buf.seek(0)
 
     r = client.post(
-        "/api/upload",
-        files={"file": ("mini.zip", buf.getvalue(), "application/zip")},
+        "/upload",
+        files=[("files", ("mini.zip", buf.getvalue(), "application/zip"))],
     )
     assert r.status_code == 200, r.text
     data = r.json()
-    assert data["status"] == "ready"
-    assert data.get("run_id")
-    assert "counts" in data
-    # STATE should point at the new run
-    with _LOCK:
-        assert STATE.get("run_id") == data["run_id"]
-        assert STATE.get("ready") is True
-        assert STATE.get("dossier") is not None
+    assert data["status"] == "ok"
+    run_id = data["run"]
+    assert run_id and run_id != "default"
+
+    cov = _wait_ready(client, run_id)
+    assert cov["status"] == "ready", cov
+    assert cov["counts"]["documents"] >= 1  # the credit limit csv
+
+    # default run untouched
+    default = client.get("/api/findings").json()
+    assert default["status"] == "ready"
+    assert default["dossier"] == "mini"
 
 
-def test_upload_rejects_non_zip(client: TestClient):
+def test_upload_accepts_loose_files(client: TestClient):
+    """The brief allows a zip OR multiple loose files."""
     r = client.post(
-        "/api/upload",
-        files={"file": ("notes.txt", b"hello", "text/plain")},
+        "/upload",
+        files=[
+            (
+                "files",
+                (
+                    "credit_limits.csv",
+                    b"DEBITOR;DEBITORNAME;KREDITLIMIT_EUR;STATUS\n"
+                    b"100000;TEST CO;10000,00;ok\n",
+                    "text/csv",
+                ),
+            ),
+        ],
     )
-    assert r.status_code == 400
-    assert r.json()["status"] == "error"
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["status"] == "ok"
+    cov = _wait_ready(client, data["run"])
+    assert cov["status"] == "ready", cov
+
+
+def test_unknown_run_is_reported(client: TestClient):
+    d = client.get("/api/findings", params={"run": "nope"}).json()
+    assert d["status"] == "error"

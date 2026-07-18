@@ -40,7 +40,7 @@ _LEGAL_FORMS = {
 _STREET_STOP = {"str", "st", "rd", "ave", "weg", "platz", "allee", "gasse", "ring"}
 _TYPE_DE = {"vendor": "Kreditor", "customer": "Debitor"}
 
-_COGNEE_TIMEOUT = 85.0
+_COGNEE_TIMEOUT = float(os.environ.get("CORTEA_COGNEE_TIMEOUT", "85"))
 _COGNEE_DATASET = "laundromat_graph"
 _COGNEE_NOTE = " Graphanalyse (Cognee) bestaetigt die Verbindung."
 
