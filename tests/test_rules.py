@@ -5,7 +5,7 @@ from datetime import date
 from decimal import Decimal
 
 from laundromat.contracts import Dossier, Document, Entity, EntityType, LensFamily, Posting, SourceRef
-from laundromat.lenses.rules import NewVendorQuickPayment, RoundAmount
+from laundromat.lenses.rules import NewVendorQuickPayment, RoundAmount, SplitPayments
 
 
 def source(line: int, excerpt: str) -> SourceRef:
@@ -235,6 +235,96 @@ class NewVendorQuickPaymentTests(unittest.TestCase):
 
     def test_empty_dossier_is_safe(self):
         self.assertEqual(list(NewVendorQuickPayment.run(Dossier(name="empty"))), [])
+
+
+class SplitPaymentsTests(unittest.TestCase):
+    def test_flags_one_cluster_and_cites_every_payment(self):
+        dossier = Dossier(
+            name="bad",
+            entities={"V1": vendor("V1", line=2)},
+            postings=[
+                posting(
+                    amount,
+                    line=line,
+                    doc_no="BATCH-V1",
+                    text="Teilzahlung Lieferantenrechnung",
+                    booking_date=date(2025, 10, 14),
+                    entity_id="V1",
+                    ledger="AP",
+                )
+                for line, amount in enumerate(("9780", "9820", "9750", "9690"), 10)
+            ],
+        )
+
+        flags = list(SplitPayments.run(dossier))
+
+        self.assertEqual(len(flags), 1)
+        flag = flags[0]
+        self.assertEqual(flag.lens_id, "K5_split_payments")
+        self.assertEqual(flag.entity_id, "V1")
+        self.assertEqual(flag.doc_no, "BATCH-V1")
+        self.assertEqual(flag.amount, Decimal("39040"))
+        self.assertEqual(len(flag.evidence), 4)
+        self.assertTrue(all(ref.line and ref.excerpt for ref in flag.evidence))
+
+    def test_ignores_invoice_pairs_distant_rows_limit_and_foreign_currency(self):
+        dossier = Dossier(
+            name="good",
+            entities={"V1": vendor("V1", line=2)},
+            postings=[
+                posting(
+                    "9500",
+                    line=10,
+                    doc_no="INV-1",
+                    text="Purchase invoice",
+                    booking_date=date(2025, 5, 1),
+                    entity_id="V1",
+                    ledger="AP",
+                ),
+                posting(
+                    "9500",
+                    line=11,
+                    doc_no="PAY-1",
+                    text="Payment",
+                    booking_date=date(2025, 5, 1),
+                    entity_id="V1",
+                    ledger="AP",
+                ),
+                posting(
+                    "9500",
+                    line=12,
+                    doc_no="PAY-2",
+                    text="Payment",
+                    booking_date=date(2025, 5, 10),
+                    entity_id="V1",
+                    ledger="AP",
+                ),
+                posting(
+                    "10000",
+                    line=13,
+                    doc_no="AT-LIMIT",
+                    text="Payment",
+                    booking_date=date(2025, 5, 1),
+                    entity_id="V1",
+                    ledger="AP",
+                ),
+                posting(
+                    "9500",
+                    line=14,
+                    doc_no="USD-1",
+                    text="Payment",
+                    currency="USD",
+                    booking_date=date(2025, 5, 1),
+                    entity_id="V1",
+                    ledger="AP",
+                ),
+            ],
+        )
+
+        self.assertEqual(list(SplitPayments.run(dossier)), [])
+
+    def test_empty_dossier_is_safe(self):
+        self.assertEqual(list(SplitPayments.run(Dossier(name="empty"))), [])
 
 
 class RoundAmountTests(unittest.TestCase):

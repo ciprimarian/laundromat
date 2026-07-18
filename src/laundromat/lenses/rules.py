@@ -9,6 +9,7 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from ..contracts import (
+    APPROVAL_LIMIT,
     Dossier,
     Document,
     EntityType,
@@ -368,6 +369,88 @@ class NewVendorQuickPayment:
                 amount=amount,
                 confidence=0.78,
             )
+
+
+@register
+class SplitPayments:
+    """K5: clustered vendor payments structured below an approval limit."""
+
+    # Practice set: 1 flag across 26,647 postings (0.004%).
+    lens_id = "K5_split_payments"
+    family = LensFamily.RULE
+    window_days = 3
+    lower_fraction = Decimal("0.80")
+
+    @staticmethod
+    def run(dossier: Dossier):
+        lower = APPROVAL_LIMIT * SplitPayments.lower_fraction
+        grouped: dict[tuple[str, str], list[Posting]] = defaultdict(list)
+
+        for posting in dossier.postings:
+            if not posting.entity_id or not _is_vendor_payment(posting):
+                continue
+            entity = dossier.entities.get(posting.entity_id)
+            if entity is not None and entity.type is not EntityType.VENDOR:
+                continue
+            amount = abs(posting.amount)
+            if amount < lower or amount >= APPROVAL_LIMIT:
+                continue
+            currency = _norm(posting.currency)
+            if currency != "eur":
+                continue
+            grouped[(_norm_id(posting.entity_id), currency)].append(posting)
+
+        for payments in grouped.values():
+            payments.sort(
+                key=lambda posting: (
+                    posting.booking_date,
+                    posting.source.file,
+                    posting.source.line or 0,
+                )
+            )
+            start = 0
+            while start < len(payments):
+                end = start + 1
+                while (
+                    end < len(payments)
+                    and (payments[end].booking_date - payments[start].booking_date).days
+                    <= SplitPayments.window_days
+                ):
+                    end += 1
+
+                cluster = payments[start:end]
+                total = sum((abs(posting.amount) for posting in cluster), Decimal(0))
+                if len(cluster) < 2 or total <= APPROVAL_LIMIT:
+                    start += 1
+                    continue
+
+                first = cluster[0]
+                references = {posting.doc_no for posting in cluster if posting.doc_no}
+                shared_reference = (
+                    next(iter(references))
+                    if len(references) == 1 and all(posting.doc_no for posting in cluster)
+                    else None
+                )
+                yield Flag(
+                    lens_id=SplitPayments.lens_id,
+                    family=SplitPayments.family,
+                    title=(
+                        f"{len(cluster)} Teilzahlungen unter der Freigabegrenze an "
+                        f"Kreditor {first.entity_id}"
+                    ),
+                    rationale=(
+                        f"Innerhalb von {(cluster[-1].booking_date - first.booking_date).days} "
+                        f"Tagen wurden {len(cluster)} Zahlungen über zusammen {total:.2f} "
+                        f"{first.currency} gebucht. Jede Einzelzahlung liegt zwischen 80 Prozent "
+                        "und der Freigabegrenze, gemeinsam überschreiten sie die Grenze."
+                    ),
+                    evidence=_evidence(cluster),
+                    entity_id=first.entity_id,
+                    doc_no=shared_reference,
+                    amount=total,
+                    confidence=0.82,
+                )
+                start = end
 
 
 @register
