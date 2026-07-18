@@ -1,13 +1,13 @@
 """Temporal lenses: lag, off-hours, master-data timing, velocity, sequence, approval.
 
-Practice-set flag rates (calibrated post-scoring merge, 26647 postings):
-  T_backdating        134  0.50%  (lag tail; Saldenvortrag + bonuses)
-  T_off_hours           0  0.00%  (hours 06:00-21:03; no per-user outliers)
-  T_master_timing       8  0.03%  (change-before-pay / self-approve)
-  T_velocity_burst      2  0.01%  (MV-U02 opening-balance / period bursts)
-  T_sequence_gap        0  0.00%  (ERFASSUNGSNUMMER empty on practice GL)
-  T_approval_timing     0  0.00%  (same-day Freigabe is normal here)
-  # all << 2% of rows; no further threshold cuts
+Practice-set flag rates (after excluding opening balances / Vortrag):
+  T_backdating          0  0.00%  (was Saldenvortrag lag; gone)
+  T_off_hours           0  0.00%
+  T_master_timing       8  0.03%
+  T_velocity_burst      0  0.00%  (was MV-U02 Vortrag day)
+  T_sequence_gap        0  0.00%
+  T_approval_timing     0  0.00%
+  # AB-2024 dropped; all << 2% of rows
 
 Baselines (working hours, lag tail, velocity median) always come from the dossier.
 Never hardcode 09-18 or FY2025. Confidence 0.2-0.5 for distributional signals.
@@ -30,6 +30,34 @@ _MIN_SEQUENCE_N = 20
 _MAX_EVIDENCE = 8
 _MASTER_PAY_WINDOW = 7  # days: change then payment
 _REVERT_WINDOW = 30
+
+_OPENING_TEXT_PREFIXES = (
+    "saldenvortrag",
+    "opening balance",
+    "brought forward",
+    "balance brought forward",
+    "bfwd",
+    "b/f",
+)
+
+
+def _is_opening_balance(p: Posting) -> bool:
+    """True for carry-forward / Vortrag rows (DE+EN). Not economic activity."""
+    attrs = p.attrs or {}
+    for key in ("BUCHUNGSTYP", "BUCHUNGSART", "PERIODENZUGEHÖRIGKEIT", "PERIODENZUGEHOERIGKEIT"):
+        raw = (attrs.get(key) or "").casefold()
+        if "vortrag" in raw or "opening" in raw or "brought forward" in raw:
+            return True
+    text = (p.text or "").casefold().strip()
+    if any(text.startswith(pref) for pref in _OPENING_TEXT_PREFIXES):
+        return True
+    if "saldenvortrag" in text[:40]:
+        return True
+    return False
+
+
+def _economic_postings(dossier: Dossier) -> list[Posting]:
+    return [p for p in dossier.postings if not _is_opening_balance(p)]
 
 
 def _sample_evidence(postings: Sequence[Posting], limit: int = _MAX_EVIDENCE) -> tuple[SourceRef, ...]:
@@ -129,7 +157,7 @@ class BackdatingLag:
 
     def run(self, dossier: Dossier) -> Iterable[Flag]:
         lags: list[tuple[int, Posting]] = []
-        for p in dossier.postings:
+        for p in _economic_postings(dossier):
             if p.posted_at is None:
                 continue
             lag = (p.posted_at.date() - p.booking_date).days
@@ -195,8 +223,9 @@ class OffHours:
     def run(self, dossier: Dossier) -> Iterable[Flag]:
         by_user: dict[str, list[tuple[datetime, Posting]]] = defaultdict(list)
         all_hours: list[float] = []
+        econ = _economic_postings(dossier)
 
-        for p in dossier.postings:
+        for p in econ:
             if p.posted_at is None or not p.user:
                 continue
             by_user[p.user].append((p.posted_at, p))
@@ -213,7 +242,7 @@ class OffHours:
         # weekend rate for the whole ledger
         weekend_flags = 0
         weekend_total = 0
-        for p in dossier.postings:
+        for p in econ:
             if p.posted_at is None:
                 continue
             weekend_total += 1
@@ -294,9 +323,9 @@ class MasterDataTiming:
         if not changes:
             return
 
-        # index payments by entity_id
+        # index payments by entity_id (skip opening balances)
         pays: dict[str, list[Posting]] = defaultdict(list)
-        for p in dossier.postings:
+        for p in _economic_postings(dossier):
             if p.entity_id:
                 pays[p.entity_id].append(p)
 
@@ -442,12 +471,13 @@ class VelocityBurst:
     family = LensFamily.TEMPORAL
 
     def run(self, dossier: Dossier) -> Iterable[Flag]:
-        if not dossier.postings:
+        econ = _economic_postings(dossier)
+        if not econ:
             return
 
         # --- daily count spikes per user ---
         by_user_day: dict[str, dict[date, list[Posting]]] = defaultdict(lambda: defaultdict(list))
-        for p in dossier.postings:
+        for p in econ:
             if not p.user:
                 continue
             day = p.posted_at.date() if p.posted_at else p.booking_date
@@ -484,11 +514,11 @@ class VelocityBurst:
 
         # --- year-end value clustering per entity ---
         by_entity: dict[str, list[Posting]] = defaultdict(list)
-        for p in dossier.postings:
+        for p in econ:
             if p.entity_id:
                 by_entity[p.entity_id].append(p)
 
-        all_dates = [p.booking_date for p in dossier.postings]
+        all_dates = [p.booking_date for p in econ]
         if not all_dates:
             return
         max_d = max(all_dates)
@@ -541,14 +571,15 @@ class SequenceGaps:
     family = LensFamily.TEMPORAL
 
     def run(self, dossier: Dossier) -> Iterable[Flag]:
-        if not dossier.postings:
+        econ = _economic_postings(dossier)
+        if not econ:
             return
 
         # collect numeric sequences from attrs
         erf_map: dict[int, list[Posting]] = defaultdict(list)
         journal_lines: dict[str, list[tuple[int, Posting]]] = defaultdict(list)
 
-        for p in dossier.postings:
+        for p in econ:
             attrs = p.attrs or {}
             erf = attrs.get("ERFASSUNGSNUMMER") or attrs.get("ENTRY_NO") or attrs.get("erfassungsnummer")
             jline = attrs.get("JOURNALZEILE") or attrs.get("JOURNAL_LINE") or attrs.get("journalzeile")
