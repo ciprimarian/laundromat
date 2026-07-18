@@ -14,13 +14,18 @@ from __future__ import annotations
 import bisect
 import os
 import re
+import shutil
+import tempfile
 import threading
+import uuid
+import zipfile
 from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from ..contracts import Dossier, Finding, Flag, SourceRef
@@ -31,6 +36,9 @@ DOSSIER_PATH = (
     or "data/practice"
 )
 
+# Upload runs land under this dir (overridable for tests).
+RUNS_DIR = Path(os.environ.get("CORTEA_RUNS_DIR") or (Path.cwd() / "data" / "runs"))
+
 CENT = Decimal("0.01")
 
 STATE: dict[str, Any] = {
@@ -40,6 +48,8 @@ STATE: dict[str, Any] = {
     "flags": [],
     "findings": [],
     "index": None,
+    "run_id": None,
+    "dossier_path": DOSSIER_PATH,
 }
 _LOCK = threading.Lock()
 
@@ -144,19 +154,31 @@ class TraceIndex:
 # --------------------------------------------------------------------------
 
 
+def _apply_run(path: str, run_id: str | None = None) -> None:
+    """Load one dossier path into STATE (used by startup and upload)."""
+    from ..pipeline import run
+
+    dossier, flags, findings = run(path)
+    index = TraceIndex(dossier)
+    with _LOCK:
+        STATE.update(
+            dossier=dossier,
+            flags=flags,
+            findings=findings,
+            index=index,
+            dossier_path=path,
+            run_id=run_id,
+            error=None,
+            ready=True,
+        )
+
+
 def _load() -> None:
     try:
-        from ..pipeline import run
-
-        dossier, flags, findings = run(DOSSIER_PATH)
-        index = TraceIndex(dossier)
-        with _LOCK:
-            STATE.update(dossier=dossier, flags=flags, findings=findings, index=index)
+        _apply_run(DOSSIER_PATH, run_id=None)
     except Exception as e:  # never let the server die on a bad dossier
         with _LOCK:
             STATE["error"] = f"{type(e).__name__}: {e}"
-    finally:
-        with _LOCK:
             STATE["ready"] = True
 
 
@@ -472,7 +494,7 @@ def api_coverage():
     return {
         "status": "ready",
         "dossier": dossier.name,
-        "dossier_path": DOSSIER_PATH,
+        "dossier_path": STATE.get("dossier_path") or DOSSIER_PATH,
         "counts": {
             "postings": len(dossier.postings),
             "entities": len(dossier.entities),
@@ -496,6 +518,78 @@ def api_coverage():
 @app.get("/", response_class=HTMLResponse)
 def index_page():
     return HTMLResponse(PAGE)
+
+
+@app.post("/api/upload")
+async def api_upload(file: UploadFile = File(...)):
+    """Accept a dossier zip, extract, run the pipeline, swap STATE to the new run."""
+    name = (file.filename or "dossier.zip").lower()
+    if not name.endswith(".zip"):
+        return JSONResponse(
+            {"status": "error", "error": "expected a .zip archive"},
+            status_code=400,
+        )
+    raw = await file.read()
+    if not raw:
+        return JSONResponse({"status": "error", "error": "empty upload"}, status_code=400)
+    if len(raw) > 200 * 1024 * 1024:
+        return JSONResponse(
+            {"status": "error", "error": "zip larger than 200 MB"},
+            status_code=400,
+        )
+
+    run_id = uuid.uuid4().hex[:12]
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    run_root = RUNS_DIR / run_id
+    if run_root.exists():
+        shutil.rmtree(run_root)
+    run_root.mkdir(parents=True)
+
+    zip_path = run_root / "upload.zip"
+    zip_path.write_bytes(raw)
+    extract_dir = run_root / "dossier"
+    extract_dir.mkdir()
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(extract_dir)
+    except zipfile.BadZipFile:
+        shutil.rmtree(run_root, ignore_errors=True)
+        return JSONResponse({"status": "error", "error": "invalid zip"}, status_code=400)
+
+    # if the zip contained a single top-level folder, use that as the dossier root
+    dossier_path = extract_dir
+    children = [p for p in extract_dir.iterdir() if not p.name.startswith(".")]
+    if len(children) == 1 and children[0].is_dir():
+        dossier_path = children[0]
+
+    try:
+        _apply_run(str(dossier_path), run_id=run_id)
+    except Exception as e:
+        with _LOCK:
+            STATE["error"] = f"{type(e).__name__}: {e}"
+            STATE["ready"] = True
+        return JSONResponse(
+            {"status": "error", "error": f"{type(e).__name__}: {e}", "run_id": run_id},
+            status_code=500,
+        )
+
+    with _LOCK:
+        dossier = STATE["dossier"]
+        n_flags = len(STATE["flags"])
+        n_findings = len(STATE["findings"])
+    return {
+        "status": "ready",
+        "run_id": run_id,
+        "dossier": dossier.name if dossier else dossier_path.name,
+        "dossier_path": str(dossier_path),
+        "counts": {
+            "postings": len(dossier.postings) if dossier else 0,
+            "entities": len(dossier.entities) if dossier else 0,
+            "documents": len(dossier.documents) if dossier else 0,
+            "flags": n_flags,
+            "findings": n_findings,
+        },
+    }
 
 
 # --------------------------------------------------------------------------
@@ -572,8 +666,18 @@ td.num { text-align:right; font-variant-numeric:tabular-nums; }
   <button id="tab-f" class="on" onclick="show('f')">Feststellungen</button>
   <button id="tab-t" onclick="show('t')">Zahlenspur</button>
   <button id="tab-c" onclick="show('c')">Abdeckung</button>
+  <button id="tab-u" onclick="show('u')">Upload</button>
 </nav>
 <main>
+  <section id="view-u" style="display:none">
+    <div class="card" style="padding:16px">
+      <div class="note">Dossier als ZIP hochladen (GDPdU-Export inkl. Begleitdokumente).
+        Der Lauf ersetzt die aktuelle Ansicht.</div>
+      <input type="file" id="zipfile" accept=".zip,application/zip">
+      <button id="tracebtn" style="margin-top:10px" onclick="doUpload()">Hochladen und pruefen</button>
+      <div id="uploadout" class="note" style="margin-top:10px"></div>
+    </div>
+  </section>
   <section id="view-f"><div class="note">Wird geladen ...</div></section>
   <section id="view-t" style="display:none">
     <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -593,10 +697,25 @@ td.num { text-align:right; font-variant-numeric:tabular-nums; }
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,
   c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 function show(v){
-  for(const k of ["f","t","c"]){
+  for(const k of ["f","t","c","u"]){
     document.getElementById("view-"+k).style.display = k===v?"":"none";
     document.getElementById("tab-"+k).className = k===v?"on":"";
   }
+}
+async function doUpload(){
+  const inp = document.getElementById("zipfile");
+  const out = document.getElementById("uploadout");
+  if(!inp.files || !inp.files[0]){ out.textContent = "Bitte eine ZIP-Datei waehlen."; return; }
+  out.textContent = "Upload laeuft ...";
+  const fd = new FormData();
+  fd.append("file", inp.files[0]);
+  try{
+    const r = await fetch("/api/upload", {method:"POST", body:fd});
+    const d = await r.json();
+    if(d.status!=="ready"){ out.innerHTML = `<span class="err">${esc(d.error||"Upload fehlgeschlagen")}</span>`; return; }
+    out.textContent = `Lauf ${d.run_id}: ${d.counts.postings} Buchungen, ${d.counts.flags} Flags, ${d.counts.findings} Feststellungen.`;
+    loadFindings(); loadCoverage(); show('f');
+  }catch(e){ out.innerHTML = `<span class="err">${esc(e)}</span>`; }
 }
 async function getJSON(url){
   const r = await fetch(url);
